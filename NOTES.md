@@ -72,17 +72,68 @@ dashboard tiles will stay empty no matter what we do to Case/Account/Contact dat
 
 URL: `https://trailsignup-d3d6728ea51c14.lightning.force.com/tableau/dashboard/Cases1/edit`
 
-Layout observed:
+Full layout (confirmed by scrolling the whole rendered dashboard, not just the top fold):
 - Filters: Created Date (default Last 30 Days), Case Origin, Case Type, Case Priority,
   Contact Reason, Service Reps.
-- **Service Health** panel (3 KPI-style tiles)
-- **Resolution Trends** panel (3 KPI-style tiles)
-- **Team Pressure** — Case Volume Low/High indicator
-- **Cost and FCR Trends**
-- **Team Impact / "What should I focus on?"** — tabs: Escalated, Open, CSAT, All
+- **Service Health** panel — Escalated Cases, Open Cases, CSAT (3 KPI tiles)
+- **Resolution Trends** panel — % First Time Resolution, Avg. Time to 1st Close, Avg. Time to Close (3 KPI tiles)
+- **Team Pressure** — Channel x Case Status heatmap, Case Volume Low/High
+- **Cost and FCR Trends** — First Contact Resolution % vs Avg. Cost scatter, by Case Created Date
+- **Team Impact / "What should I focus on?"** — tabs: Escalated, Open, CSAT, All (Service Reps stacked bar)
+- **Top Case Escalations and Priority** — Contact Reason x Case Priority table
+- **What causes friction?** — Contact Reason stacked bar by Case Status
+- **What cases are the highest cost?** — Contact Reason vs Cost scatter
+- **Total Cases** / **Total Cases Closed** KPI tiles
+- **Case Trend by Status** — stacked area by Case Created Date
+- **Where is the traffic coming from?** — Case Origin donut
+- **Case Satisfaction** panel — Satisfaction Trend, Case Origin, Score by Priority (3 tiles)
+- **Service Rep Performance** — Highest Avg Time to Close, Lowest Avg 1st Time to Close, Highest First Call Resolution %
 
-CSAT is one of the tabs here too, so this dashboard will partially work now (Case/Account/Contact-driven
-tiles) and partially stay blank until the survey data blocker above is resolved.
+### Tile-by-tile status (as of 2026-07-23, Last 30 Days filter, org has 180 seed Cases all created 2026-06-24)
+
+**Populated / working now:** Open Cases (128), Avg. Time to 1st Close (21.4h), Avg. Time to Close (21.59h),
+Team Pressure heatmap, Team Impact "Open"/"All" tabs, "What causes friction?", Total Cases (180),
+Case Trend by Status, "Where is the traffic coming from?", Total Cases Closed (52), Service Rep Performance's
+"Highest Avg Time to Close" and "Lowest Avg 1st Time to Close" charts.
+
+**Blank/zero, with confirmed root cause (10 tiles, 3 root causes):**
+
+1. **`Case.IsEscalated` boolean is false on all 180 Cases** (even the 3 with `Status = "Escalated"` —
+   status and the IsEscalated flag are independent fields; the semantic model's escalation measures all
+   key off `IsEscalated`, not `Status`). Breaks:
+   - Escalated Cases KPI (Service Health) = 0
+   - Team Impact → "Escalated" tab = No results
+   - Top Case Escalations and Priority table = all zeros
+   - Calculated measures: `Escalated_Cases_clc`, `Escalation_Rate_clc`, `My_Escalated_Cases_SI_clc`
+
+2. **`AgentWork` = 0 rows**, so `Cost_SI_clc` (`{FIXED Case.Case_Id : SUM(AgentWork.Active_Time)} / 3600 * Agent_Cost_prm`)
+   has nothing to sum per Case. Breaks:
+   - Cost and FCR Trends chart (empty on both axes, not just zero)
+   - "What cases are the highest cost?" chart (empty)
+   - Also blocks Speed to Answer / SLA measures used elsewhere (see Data gaps section above)
+
+3. **Only 46 `EmailMessage` rows exist across 180 Cases** (52 of which are closed). `FCR_Flag_clc` only
+   fires when `Case.IsClosed = true` AND that Case has **exactly one** related EmailMessage
+   (`Email_Count_clc = {FIXED Case.Case_Id : COUNT(Email_Message.Email_Message_Id)}`). Almost no Case
+   currently satisfies both conditions. Breaks:
+   - % First Time Resolution KPI (Resolution Trends) = 0%
+   - Service Rep Performance → "Highest First Call Resolution %" = all 0%
+   - Calculated measures: `FCR_Flag_clc`, `First_Contact_Resolution_Percentage_clc`, `My_First_Contact_Resolution_Percentage_SI_clc`
+
+**Blank, blocked on the Survey/CSAT issue (4 tiles)** — see blocker section above:
+- CSAT KPI (Service Health) = "–"
+- Team Impact → "CSAT" tab = No results
+- Case Satisfaction panel — all 3 tiles (Satisfaction Trend, Case Origin, Score by Priority) = No results
+
+### Fix plan for this dashboard (dependency order)
+
+1. Flip `IsEscalated = true` on a realistic subset of Cases (e.g. the 3 already `Status = Escalated`,
+   plus more for volume/variety across Contact Reason and Priority).
+2. Create `AgentWork` records tied to Cases (also feeds Speed to Answer/SLA measures on other dashboards).
+3. Attach exactly one `EmailMessage` to a realistic subset of closed Cases, to move FCR% off 0%.
+4. CSAT/Survey chain stays blocked until the API blocker above is resolved — explicitly deferred.
+
+Steps 1–3 fix 6 of the 10 blank tiles; CSAT-driven tiles (4) remain blank until step 4 is unblocked.
 
 ## Repo
 
