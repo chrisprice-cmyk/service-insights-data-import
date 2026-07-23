@@ -135,6 +135,123 @@ Case Trend by Status, "Where is the traffic coming from?", Total Cases Closed (5
 
 Steps 1–3 fix 6 of the 10 blank tiles; CSAT-driven tiles (4) remain blank until step 4 is unblocked.
 
+## Historical Case cohort — generation design (confirmed 2026-07-23)
+
+Goal: give the Cases dashboard genuine time-series/trend variance (Avg Time to
+Close/1st Close, YoY, Case Trend by Status, etc.) by adding a large, historically
+spread batch of new Cases. **Strictly additive** — the existing 180 seed Cases
+(all created 2026-06-24) are left completely untouched, no updates or deletes.
+
+- **Volume:** 2,500 new Case records.
+- **Date spread:** `CreatedDate` distributed across the trailing 24 months, mild
+  seasonality (slight dip in Dec, slight bump in Jan/Sep) rather than pure uniform
+  random, so month-over-month/YoY charts look organic.
+- **Status / close mix:** ~85% closed, ~15% open/in-progress (New, Working, Waiting
+  on Customer, Escalated). Open cases skew toward recent CreatedDates (an 18-month-old
+  Case still "New" would look broken).
+- **Close-date lag:** for closed Cases, `ClosedDate = CreatedDate + lag`, where lag is
+  drawn from a distribution that varies by Priority (Critical/High resolve faster on
+  average, Low slower) plus noise — this is what drives believable Avg Time to
+  Close/1st Close spread.
+- **Field flavor:** reuse the existing 180 Cases' distributions so new records blend in —
+  Origin (Chat-heavy, some Phone/Email/Website/social), Type (Product Support/Account
+  Support/General, ~45% null matching current rate), Priority (Medium-heavy, Critical rare).
+- **Dashboard fixes layered in at generation time (same pass, not a separate follow-up):**
+  1. `IsEscalated = true` on a realistic subset (Status=Escalated cases plus more for
+     volume/variety across Contact Reason and Priority). ✅ Viable — plain field set on insert.
+  2. ~~`AgentWork` records created tied to each new Case.~~ ❌ **Blocked** — see new blocker below.
+  3. Exactly one `EmailMessage` attached to a realistic subset of closed Cases (drives FCR%). ✅ Viable.
+- CSAT/Survey chain remains explicitly deferred (see blocker section above).
+- Audit-field backdating confirmed viable via test insert (see "Errors and fixes" — Case.CreatedDate
+  is createable=true and the org's "Set Audit Fields upon Record Creation" permission is enabled).
+
+## ⚠️ BLOCKER: AgentWork cannot be bulk-seeded via normal insert either
+
+Same category of problem as the Survey/CSAT blocker above, discovered while designing the
+historical Case cohort's AgentWork fix:
+
+- Test insert (`sf data create record -s AgentWork -v "UserId=... WorkItemId=<CaseId>
+  ServiceChannelId=<Cases channel Id>"`) failed with `FIELD_INTEGRITY_EXCEPTION: The agent's
+  status is not associated with the channel for this work.` — AgentWork rows are only created
+  by the live Omni-Channel routing engine when a real agent is actively in a Presence status
+  on that channel. Not a plain-insert-friendly object.
+- Even if that validation were worked around (e.g. scripting a Presence status change first),
+  the fields the Cost/Speed-to-Answer measures actually depend on — `Status`, `ActiveTime`,
+  `HandleTime`, `AcceptDateTime`, `CloseDateTime` — are all **createable=false**. A successful
+  insert would still leave those null/zero.
+- **Decision:** drop AgentWork seeding from the historical-cohort generation pass. Cost and FCR
+  Trends / "What cases are the highest cost?" / Speed to Answer / Avg Handle Time / SLA
+  Adherence tiles remain blocked, grouped with the CSAT/Survey deferral for future investigation
+  (possible paths: real Omni-Channel Presence scripting via browser automation at small scale,
+  or a Support/SE escalation, same as the Survey approach).
+
+**Tooling decided:** Python + Bulk API 2.0, via the `simple-salesforce` library (installed locally
+with `pip3 install --user simple-salesforce`; `SFBulk2Type.insert()` takes `records: List[Dict]`
+plus `batch_size`/`concurrency`/`wait` params — this is what the loader will call).
+
+## Field templates captured from the existing 180 Cases (for the new cohort to match)
+
+- **Origin:** Chat=90, Community=10, Email=18, Mobile Device=8, Phone=27, Website=8, Facebook=4,
+  Instagram=2, LinkedIn=2, Twitter=9, Case=1, Text=1.
+- **Type:** Product Support=27, Account Support=38, General=33, Technical Issue=1, null=81.
+- **Priority:** Critical=8, High=28, Low=24, Medium=120.
+- **Status:** New=103, Closed=52, Working=15, Waiting on Customer=7, Escalated=3.
+- **Reason:** null=116, Problem Resolved=52, New problem=6, Feature Request=4, Documentation Issue=1,
+  Mail delivery issue=1.
+- **BusinessHoursId:** existing Cases all use the org default `01mKA000000Gp9GYAS` ("24/7
+  Follow-The-Sun Service") — reuse this for new Cases too, avoids needing per-region logic.
+- **OwnerId pool** (8 users): `005KA000000Uj9UYAS` (Automated Process, 64), `005KA0000013WMCYA2`
+  (Chris Price, 27), `005KA000000UjAOYA0` (Tim Service, 24), `005KA000000UjAPYA0` (Quentin Engineer, 16),
+  `005KA000000UjAQYA0` (Linda Service, 15), `005KA000000UjANYA0` (Steven Service, 13),
+  `005KA000000UjARYA0` (Jay Service, 11), `005KA000000UjASYA0` (Brenda Service, 9).
+- **CreatedById:** existing Cases use only 2 values — `005KA0000013WMCYA2` (116) and `005KA000000Uj9UYAS`
+  (64). Reuse this pair for new Cases' CreatedById (separate from OwnerId).
+- **AccountId/ContactId:** only 96 of 180 existing Cases have a non-null Account/Contact pair (rest are
+  null — fine to leave a similar fraction null on the new cohort). Org has 91 Accounts / 144 Contacts
+  total; Contact.AccountId gives valid Account/Contact pairs to draw from when a new Case needs one.
+- **Subject/Description flavor:** short, realistic per-Type subject lines exist as samples in this
+  session's scrollback (e.g. "Please expedite my order.", "Turbine not reaching operating speed",
+  "How do I obtain your annual report?") — reuse this style when generating new Subjects; note
+  `Description` is not SOQL-filterable (can't `!= null` it) so exact fill-rate wasn't measured, treat
+  as optional/sparse like the original data.
+
+## EmailMessage field notes (for the FCR fix)
+
+Createable fields confirmed via describe: `ParentId` (→ Case), `CreatedById`, `CreatedDate`,
+`LastModifiedDate`, `LastModifiedById`, `TextBody`, `HtmlBody`, `Subject`, `FromAddress`, `ToAddress`,
+`Incoming`, `Status` (required, picklist), `MessageDate`, `FromId` (→ Contact/Lead/User). Plan: one
+EmailMessage per FCR-eligible closed Case, `ParentId` = the Case, dated shortly after CreatedDate.
+
+## Project scaffold started
+
+Created `src/service_insights_data_import/` (Python package, empty so far) and `data/` (for any
+CSV/lookup files the generator needs) under the project root. Not yet committed. `simple-salesforce`
+installed locally via `pip3 install --user simple-salesforce` for prototyping — **not yet added to
+a requirements.txt/pyproject.toml** (still needs proper packaging).
+
+## ⏸️ Paused here (2026-07-23) — resume point
+
+Session paused mid-scaffolding at user's request (laptop shutdown for power). Nothing destructive in
+flight; org (Prime_SDO) untouched beyond the two throwaway test inserts (Case, already deleted) and
+one intentionally-failed AgentWork test insert (which never actually created a record, per the
+FIELD_INTEGRITY_EXCEPTION above).
+
+**Next steps to pick back up:**
+1. Turn the `src/service_insights_data_import/` scaffold into real modules: a config/constants module
+   holding the field-template distributions above, a `generate_cases.py` (builds the 2,500-record
+   list per the design in "Historical Case cohort — generation design" above), a
+   `generate_email_messages.py` (FCR fix), and a `load.py` wrapping `simple_salesforce.bulk2` for the
+   actual inserts (with a `--dry-run` flag that just writes the generated records to CSV under `data/`
+   instead of hitting the org, and a hard safety check that it only ever INSERTs, never
+   updates/deletes, to honor the "leave the existing 180 Cases alone" constraint).
+2. Add a `requirements.txt` (simple-salesforce) and a small CLI entrypoint.
+3. Dry-run first, eyeball the generated CSV for realism, then live-run against Prime_SDO.
+4. Re-check the Cases1 dashboard tiles after the load (Total Cases, Total Cases Closed, Avg Time to
+   Close/1st Close, Escalated Cases, % First Time Resolution, Case Trend by Status, Where is the
+   traffic coming from — expect these to visibly improve; Cost/FCR-cost tiles and CSAT tiles remain
+   blocked per the two documented blockers above).
+5. Commit the working generator + docs, push to GitHub.
+
 ## Repo
 
 Public repo created for this project: https://github.com/chrisprice-cmyk/service-insights-data-import
