@@ -577,6 +577,40 @@ platform blockers in this expanded scope. Remaining permanent blockers unchanged
 (both tracks) and Salesforce Feedback Management Survey/SurveyResponse (Tableau Next CSAT only —
 CRMA's CSAT is unaffected, see `Case.CSAT__c` finding above).
 
+## Additional build requirements — confirmed by user 2026-07-24 (all four accepted)
+
+Suggested proactively, all four accepted for this build (not deferred):
+
+1. **Idempotency / batch marker.** Every record this tool creates gets tagged with a recognizable
+   batch identifier — plan: reuse `Case.External_ID__c` (createable, already exists, currently
+   101/180 filled on organic data so partial reuse is fine) with a value like
+   `SI-GEN-<run-timestamp>`, or a dedicated custom field if `External_ID__c` turns out to collide
+   with other tooling. On startup, the tool queries for existing `SI-GEN-*` batches and offers to
+   skip/top-up/report rather than blindly re-running. This also gives a safe, explicit way to
+   identify (and later delete, if ever needed) a specific generated batch without touching organic
+   Case data.
+2. **Enforced additive-only guarantee, at the code level, not just documented intent.** The loader
+   must refuse — as a hard assertion, not a comment — to send any UPDATE or DELETE against a Case
+   Id that isn't in the batch it just inserted in the same run. The only UPDATE this tool ever
+   issues is the Status-flip on its own freshly-inserted Cases (see CaseHistory design above); it
+   should be structurally incapable of touching the original 180 seed Cases or any other existing
+   data.
+3. **Built-in `--verify` post-load check.** After a live run, re-query the key aggregates that
+   both tracks' dashboards actually use — Total Cases, Escalated Cases, EmailMessage-per-closed-Case
+   rate, CaseArticle-linked-Case count, Task-linked-to-Case count, CSAT__c fill rate — and print a
+   pass/fail summary against expected ranges. Lets an SE (or CI) confirm the load worked without
+   manually opening every dashboard.
+4. **Named `--profile` presets.** `quick` (small smoke-test volume, e.g. 200 Cases / 3 months),
+   `standard` (the 2,500 / 24-month default this project was scoped around), `enterprise` (larger
+   volume for a "mature org" demo story, e.g. 10,000 / 36 months) — thin wrappers over the same
+   underlying config flags, so most users never need to touch raw volume/window numbers directly.
+5. **README symptom→cause table.** A single table mapping "if dashboard tile X is still blank
+   after running this tool, here's why" — covering every tile affected by the two permanent
+   blockers (AgentWork/Omni-Channel: Cases1 Cost/FCR-cost tiles, Omni-Channel dashboard, My Service
+   Performance's Omni half, CRMA's Service Omni + Service Agent Activity/Telephony Omni-adjacent
+   tiles; Survey/SurveyResponse: Tableau Next CSAT tiles only, not CRMA's `CSAT__c`-based tiles) —
+   so future SEs don't have to re-derive this from scratch.
+
 ## Repo
 
 Public repo created for this project: https://github.com/chrisprice-cmyk/service-insights-data-import
