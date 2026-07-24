@@ -375,6 +375,178 @@ implications, not yet built:
   an authenticated `sf` CLI org alias or equivalent), what the tool does/doesn't do, how to point
   it at a different org, how to run dry-run vs live.
 
+---
+
+# Track 2: CRMA Service Analytics (2026-07-24)
+
+**Kept deliberately separate from the Tableau Next "Service Insights" analysis above.** Same org
+(Prime_SDO), different app, different underlying architecture. Goal here is to independently map
+what data CRMA Service Analytics needs, then compare the two tracks side by side so we can decide
+whether to ship one joined data-generation pass or two separate ones.
+
+App: **CRM Analytics — Service Analytics**, `https://trailsignup-d3d6728ea51c14.lightning.force.com/analytics/application/00lKA000000tPGnYAM/edit`
+(folder id `00lKA000000tPGnYAM`, workspace label "Service Analytics").
+
+## Architecture — how this differs from Tableau Next
+
+CRMA does **not** use the Data Cloud DMO/semantic-model layer at all. Instead:
+
+- A **Wave dataflow** (`Service_Analytics_eltDataflow`, id `02KKA000000cN2b2AE`) runs `sfdcDigest`
+  extracts directly against CRM SObjects (Case, CaseHistory, AgentWork, Task, Event,
+  LiveChatTranscript, LiveChatTranscriptEvent, UserServicePresence, Opportunity, Knowledge__kav,
+  Knowledge__ka, ServiceChannel, ServicePresenceStatus, Account, Contact, User, UserRole, Group,
+  RecordType, CaseArticle, Knowledge__ViewStat, Knowledge__VoteStat, Knowledge__DataCategorySelection).
+- These get joined/computed/registered into **10 Wave datasets** (folder `Service_Analytics`):
+  `ServiceCase`, `ServiceCaseHistory`, `ServiceOmniAgentWork`, `ServiceChatTranscript`,
+  `ServiceChatTranscriptEvent`, `ServiceActivity`, `ServiceOpportunity`, `ServiceKnowledge`,
+  `ServiceKnowledgeAttached`, `ServiceOmniUserPresence`.
+- Dashboards query these Wave datasets directly (SAQL/query steps), no separate metric-layer
+  indirection like Tableau Next's `_clc` calculated measures. This means **field lineage is much
+  more direct** here — what you see in the dataflow extract is what the dashboard gets, no
+  business-hours/FIXED-aggregation chains to trace.
+- Confirmed via `/services/data/v67.0/wave/dataflows/<id>` (full definition fetched, ~190 nodes)
+  and cross-checked each `Register_*` node's `source` back to its `Extract_*` origin.
+
+## App structure — 13 dashboards
+
+Full list confirmed via `/services/data/v67.0/wave/folders/00lKA000000tPGnYAM` featuredAssets:
+
+| Dashboard (name) | Label | Backing dataset(s) |
+|---|---|---|
+| `Service_Overview1` | Service Analytics Overview | ServiceCase |
+| `Service_By_OpenCases1` | Service Open Cases | ServiceOpportunities, ServiceCase |
+| `Service_Backlog_Analysis1` | Service Backlog | ServiceCase |
+| `Service_By_TeamEfficiency1` | Service Agent Performance | ServiceCase |
+| `Service_Agent_Activity1` | Service Agent Activity | ServiceActivity |
+| `Service_By_EngagementEfficiency1` | Service Channel Review | ServiceCase |
+| `Service_Omni1` | Service Omni | ServiceOmniAgentWork |
+| `Service_Live_Agent_Chat1` | Service Live Agent Chat | ServiceChatTranscript |
+| `Service_Telephony1` | Service Telephony | ServiceActivity |
+| `Service_Knowledge1` | Service Knowledge Efficiency | ServiceCase |
+| `Service_Knowledge_Metrics1` | Service Knowledge Usage | ServiceKnowledge, ServiceKnowledgeAttached, ServiceCase |
+| `Service_Account_Profile1` | Service Account Profile | ServiceOpportunities, ServiceActivity, ServiceCase, ServiceCaseHistory |
+| `Service_Customer_Satisfaction1` | Service Customer Satisfaction | ServiceCase |
+
+**Key structural finding: 9 of 13 dashboards depend only on `ServiceCase`** (Overview, Backlog,
+Team Efficiency, Channel Review, Knowledge Efficiency, Customer Satisfaction, plus contributing to
+Open Cases/Knowledge Usage/Account Profile). `ServiceCase` is a near-direct extract of the `Case`
+object — this is the single highest-leverage dataset in this whole app, same as Cases1 was for
+Tableau Next.
+
+## Per-dashboard findings
+
+### CSAT — resolved cleanly, better than Tableau Next's path
+
+CRMA's CSAT does **not** go through Salesforce Feedback Management Surveys at all (the blocked
+chain from the Tableau Next track). It reads straight off a custom field:
+
+- `Case.CSAT__c` — custom Number field, **`createable=true`**, already **100% populated** on the
+  existing 180 Cases (confirmed via SOQL: `COUNT(Id) WHERE CSAT__c != null` = 180/180).
+- Dataflow nodes `Case_CSAT_Mea`, `compute_AgentWorkCSAT`, `compute_LiveChatTranscriptCSAT` all
+  just pass `Case.CSAT__c` through (with a `-999` sentinel for null/no-case joins).
+- **This means Service Customer Satisfaction (and any other CSAT-driven tiles here) can be fully
+  solved just by setting `CSAT__c` on our generated Cases** — no Survey/SurveyResponse blocker,
+  no separate object chain. Genuinely easier here than on the Tableau Next side.
+
+### Service Omni (`Service_Omni1`) — blocked, same root cause as Tableau Next
+
+Backed by `ServiceOmniAgentWork`, which extracts `AgentWork.AcceptDateTime/ActiveTime/HandleTime/
+SpeedToAnswer/Status/...` directly. **Same AgentWork blocker already documented** (org has 0
+AgentWork rows; the fields needed are createable=false regardless; Omni-Channel routing engine
+required for real records). No new information, but confirms the blocker applies identically here.
+
+### Service Agent Activity + Service Telephony — new, real, and fixable gap
+
+Both driven by `ServiceActivity`, built from `Task`/`Event` records joined to their parent Case via
+`WhatId`. Checked live: **87 Tasks and 26 Events have some `WhatId` set, but 0 of either point at a
+Case** (`SELECT COUNT(Id) FROM Task WHERE What.Type = 'Case'` = 0). Unlike AgentWork, this is a
+**plain, fully createable gap** — Task/Event are normal SObjects, `WhatId` pointing at a Case Id is
+just a lookup field. If we want these two dashboards to populate, the generator needs to also
+create some Task/Event records with `WhatId` = one of our generated Case Ids (e.g. call-logging
+Tasks with `CallDurationInSeconds`, `CallDisposition`). Not yet decided whether this is in scope.
+
+### Service Live Agent Chat — separate, smaller gap
+
+Backed by `ServiceChatTranscript`/`ServiceChatTranscriptEvent`, sourced from `LiveChatTranscript`/
+`LiveChatTranscriptEvent`. Org already has real rows here (64 LiveChatTranscript, 193
+LiveChatTranscriptEvent) — both objects are mostly createable (41/57 and 10/18 fields
+respectively). Not audited in depth (lower priority — single dashboard, org already has some
+volume), but no platform-level blocker found the way AgentWork has one.
+
+### Service Knowledge Efficiency + Service Knowledge Usage — separate, smaller track
+
+`Service_Knowledge1` runs off `ServiceCase` alone (benefits automatically from our Case generator,
+same as the other 8 Case-only dashboards) — but its actual tiles (Attach Rate, % Has Articles
+Attached) need Cases to be linked to Knowledge articles via `CaseArticle`, which our current plan
+doesn't populate. `Service_Knowledge_Metrics1` additionally needs `ServiceKnowledge`/
+`ServiceKnowledgeAttached`, sourced from `Knowledge__kav`/`Knowledge__ka`/`CaseArticle` — mixed
+createability (`Knowledge__kav` 32/68 createable, `Knowledge__ka` 0/19, `CaseArticle` 4/11). This
+lines up with the Knowledge-Article-attachment measure family we already flagged as out-of-scope
+on the Tableau Next side — same underlying gap, appears on both tracks, still needs a scope
+decision from you.
+
+### Everything else (Overview, Open Cases, Backlog, Team Efficiency, Channel Review, Customer
+Satisfaction, Account Profile's Case/CaseHistory portion)
+
+All resolve to fields already on our Case generation plan: `Origin`, `Reason`, `Type`, `Status`,
+`Priority`, `IsClosed`, `IsEscalated`, `CreatedDate`, `ClosedDate`, `OwnerId`, `AccountId`,
+`ContactId`, `CaseNumber`, `RecordTypeId`, plus the `CSAT__c` field above. **These should all
+populate correctly from the same generated Case cohort already designed for Tableau Next — no
+separate generation logic needed**, just confirmed field overlap.
+
+One extra CRMA-specific field worth setting for realism, all createable and already used by the
+existing 180 Cases: `Type_of_Support__c` (85/180 filled), `Product_Name__c` (85/180 filled, but
+`createable=false` — a formula/rollup, skip it), `Product_Family_KB__c` (8/180 filled, sparse is
+fine), `External_ID__c` (101/180 filled), `First_Contact_Close__c` (144/180 filled — a boolean,
+likely CRMA's own First-Contact-Resolution flag, worth setting deliberately rather than leaving
+random, since it's a closer FCR signal than the EmailMessage-count proxy Tableau Next uses).
+Three fields (`Time_Open__c`, `CreatedDate__c`, `ClosedDate__c`) exist and are createable but are
+**0% filled on the existing 180 Cases** — likely legacy/unused template fields shadowing the
+standard `CreatedDate`/`ClosedDate`; leave them null to match current org convention rather than
+guessing they're load-bearing.
+
+`ServiceCaseHistory` (feeding Service Account Profile's trend tiles) is a direct extract of
+`CaseHistory` (7 fields) — this is a real SObject the org already has 18,974 rows in (confirmed via
+`SELECT COUNT() FROM CaseHistory`), and it gets populated automatically by any Case field change,
+including the Status-flip update our Tableau Next design already does for the `Case_Update`/
+Avg-Time-to-1st-Close fix. **No extra work needed here — it's a side effect of the two-step
+create-then-update pattern already designed for the other track.**
+
+## Side-by-side comparison — Tableau Next Service Insights vs CRMA Service Analytics
+
+| | Tableau Next Service Insights | CRMA Service Analytics |
+|---|---|---|
+| Dashboards | 3 (Cases, Omni-Channel, My Service Performance) | 13 |
+| Architecture | Data Cloud DMOs + semantic model (`_clc` calculated measures) | Wave dataflow + datasets, direct SObject extracts |
+| Core data need | Case + EmailMessage (for FCR) | Case only, for 9/13 dashboards |
+| CSAT | **Blocked** — Salesforce Feedback Management Survey/SurveyResponse chain, all fields non-createable | **Solved** — plain `Case.CSAT__c` custom field, createable, already 100% filled |
+| AgentWork/Omni | **Blocked** — Omni-Channel routing validation + non-createable metric fields | **Same blocker** — identical root cause, 1 dashboard fully blocked (Service Omni) + partial (My Service Performance / Service Agent Activity) |
+| First Contact Resolution | Needs exactly-one-EmailMessage-per-closed-Case (proxy signal) | Has a dedicated `First_Contact_Close__c` boolean field already on Case — more direct, no EmailMessage dependency |
+| Avg Time to 1st Close | Needs real `CaseHistory` Status-change row (two-step create+update design) | `ServiceCaseHistory` dataset is a direct `CaseHistory` extract — same two-step design produces the history rows this needs too, for free |
+| Knowledge-Article scope | Flagged out-of-scope family found in semantic model, unconfirmed | Same underlying gap (CaseArticle/Knowledge linkage), affects 2 dashboards, unconfirmed |
+| Extra gap not on the other track | — | `ServiceActivity` (Task/Event linked to Case via `WhatId`) — currently 0 records, needed for Service Agent Activity + Service Telephony (2 dashboards) |
+
+**Overlap is very high**: both tracks are fundamentally "generate realistic Case records with the
+right fields," and the CaseHistory-producing two-step insert-then-update pattern already designed
+for Tableau Next happens to be exactly what CRMA's `ServiceCaseHistory` dataset needs too. The
+divergences are narrow and additive, not conflicting:
+- CRMA needs a few extra Case fields set (`CSAT__c`, `Type_of_Support__c`, `First_Contact_Close__c`,
+  `External_ID__c`, `Product_Family_KB__c`) that Tableau Next doesn't touch, but setting them
+  causes no harm to the Tableau Next side.
+- CRMA optionally wants Task/Event records with Case `WhatId` links (2 dashboards) — genuinely new
+  scope, not required by Tableau Next at all.
+- Both tracks hit the identical AgentWork wall and the identical Knowledge-Article-attachment
+  question mark.
+- EmailMessage generation (for Tableau Next FCR) has no CRMA dependency, but doesn't conflict with
+  it either.
+
+**This looks like a strong candidate for a single joined data-generation pass** (one Case cohort,
+with the union of both tracks' field requirements set at generation time) rather than two separate
+tools — the "two separate deployments" version would mean generating the *same* 2,500 Cases twice
+with slightly different field sets, which is wasted duplication with no isolation benefit, since
+neither track's fields conflict with the other's. Final call is yours — no code committed to
+either approach yet.
+
 ## Repo
 
 Public repo created for this project: https://github.com/chrisprice-cmyk/service-insights-data-import
