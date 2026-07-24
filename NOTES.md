@@ -547,6 +547,36 @@ with slightly different field sets, which is wasted duplication with no isolatio
 neither track's fields conflict with the other's. Final call is yours — no code committed to
 either approach yet.
 
+## Scope decisions — confirmed by user 2026-07-24
+
+1. **Joined single deployment.** One generator, one Case cohort, superset of both tracks' field
+   requirements. No separate "CRMA-only" vs "Tableau-Next-only" tool.
+2. **Knowledge-Article scope: IN.** Both the Tableau Next out-of-scope family
+   (`Cases_With_Knowledge_Attachments_SI_clc` etc.) and CRMA's `Service_Knowledge_Metrics1`/
+   `Service_Knowledge1` tiles get addressed via `CaseArticle` linkage.
+   - Org has 69 `Knowledge__kav` articles (68 Online/published) and only 16 existing `CaseArticle`
+     links — plenty of published article inventory to attach to new Cases.
+   - `CaseArticle` createable fields confirmed: `CaseId`, `KnowledgeArticleId`, `ArticleLanguage`,
+     `ArticleVersionNumber` — a plain junction insert, no blockers. Plan: attach 1 (rarely 2)
+     published Knowledge article to a realistic subset of closed Cases (drives Attach
+     Rate/Knowledge-Time-to-Close measures on both tracks).
+3. **Task/Event (ServiceActivity) scope: IN.** Needed for CRMA's Service Agent Activity + Service
+   Telephony dashboards (currently 0 Task/Event rows link to a Case via `WhatId`).
+   - `Task` createable fields confirmed: `WhatId`, `WhoId`, `Subject`, `ActivityDate`, `Status`,
+     `Priority`, `OwnerId`, `CreatedDate`, `CallDurationInSeconds`, `CallType`, `CallDisposition`,
+     `TaskSubtype` — all plain, insertable. `CallDisposition` has no constrained picklist values
+     defined in this org (free text) so any reasonable value works.
+   - Plan: create Task records (call-logging flavor, `WhatId` = generated Case, plausible
+     `CallDurationInSeconds`/`CallType`) against a subset of generated Cases, dated near the
+     Case's `CreatedDate`.
+
+Net effect: the generator now produces (per closed Case, layered): Case → optional EmailMessage
+(FCR, Tableau Next) → optional CaseArticle link (Knowledge attach) → optional Task (call activity,
+CRMA) → Status-flip update (CaseHistory, both tracks). All additive, all confirmed createable, no
+platform blockers in this expanded scope. Remaining permanent blockers unchanged: AgentWork/Omni
+(both tracks) and Salesforce Feedback Management Survey/SurveyResponse (Tableau Next CSAT only —
+CRMA's CSAT is unaffected, see `Case.CSAT__c` finding above).
+
 ## Repo
 
 Public repo created for this project: https://github.com/chrisprice-cmyk/service-insights-data-import
