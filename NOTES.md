@@ -583,12 +583,14 @@ Suggested proactively, all four accepted for this build (not deferred):
 
 1. **Idempotency / batch marker.** Every record this tool creates gets tagged with a recognizable
    batch identifier — plan: reuse `Case.External_ID__c` (createable, already exists, currently
-   101/180 filled on organic data so partial reuse is fine) with a value like
-   `SI-GEN-<run-timestamp>`, or a dedicated custom field if `External_ID__c` turns out to collide
-   with other tooling. On startup, the tool queries for existing `SI-GEN-*` batches and offers to
-   skip/top-up/report rather than blindly re-running. This also gives a safe, explicit way to
-   identify (and later delete, if ever needed) a specific generated batch without touching organic
-   Case data.
+   101/180 filled on organic data so partial reuse is fine). **Confirmed `External_ID__c` has a
+   `unique=true` constraint**, so the value can't be one shared literal per run — each Case gets its
+   own per-record-unique value of the form `SI-GEN-<run-id>-<seq>` (shared `SI-GEN-<run-id>-` prefix,
+   unique trailing sequence number). `LIKE 'SI-GEN-<run-id>-%'` finds one run's batch;
+   `LIKE 'SI-GEN-%'` finds every batch this tool has ever created. On startup, the tool queries for
+   existing `SI-GEN-%` batches and offers to skip/top-up/report rather than blindly re-running. This
+   also gives a safe, explicit way to identify (and later delete, if ever needed) a specific
+   generated batch without touching organic Case data.
 2. **Enforced additive-only guarantee, at the code level, not just documented intent.** The loader
    must refuse — as a hard assertion, not a comment — to send any UPDATE or DELETE against a Case
    Id that isn't in the batch it just inserted in the same run. The only UPDATE this tool ever
@@ -664,11 +666,12 @@ plugs directly into the batch-tagging mechanism already agreed above (see "Addit
 requirements," item 1) — the batch tag is what makes a clean undo possible at all, so the two are
 being designed together:
 
-- Every record the tool creates in a run (Case, EmailMessage, CaseArticle, Task) gets stamped with
-  the same batch identifier — plan: `Case.External_ID__c = 'SI-GEN-<run-id>'` on every generated
-  Case, and the related EmailMessage/CaseArticle/Task records get linked back to those Case Ids
-  (so they're findable via the Case relationship even without their own tag field).
-- A separate CLI subcommand, e.g. `python -m service_insights_data_import undo --batch SI-GEN-<run-id>`
+- Every Case the tool creates in a run gets a per-record-unique `External_ID__c` sharing the run's
+  batch prefix — `SI-GEN-<run-id>-<seq>` (see "Idempotency / batch marker" above; `External_ID__c`
+  is `unique=true`, so a single shared literal per run isn't possible). The related
+  EmailMessage/CaseArticle/Task records get linked back to those Case Ids (so they're findable via
+  the Case relationship even without their own tag field).
+- A separate CLI subcommand, e.g. `python -m service_insights_data_import undo <run-id>`
   (or `--last` to target the most recent run without having to look up the id), does the reverse in
   strict dependency order: delete Task/CaseArticle/EmailMessage rows tied to the batch's Cases
   first, then delete the Cases themselves last (deleting a Case first would cascade-orphan or block
@@ -687,6 +690,111 @@ being designed together:
 - This also gives a natural non-destructive alternative to a true delete: `undo --dry-run` can
   first print exactly what a real undo would remove, so an SE can sanity-check scope before
   confirming, mirroring the same dry-run-first pattern used for the forward load.
+
+## Owner pool + per-rep performance variance (2026-07-24)
+
+User asked to cap the Case owner pool low (~10 reps) with some reps performing better than others,
+so "Service Rep Performance" / "My Service Performance" tiles show believable spread instead of every
+rep looking statistically identical.
+
+- `config.MAX_OWNER_POOL_SIZE = 10` caps `org_ctx.owner_ids`, which `org_context.discover()` already
+  ranks by real existing Case ownership (`SELECT OwnerId, COUNT(Id) ... GROUP BY OwnerId ORDER BY
+  COUNT(Id) DESC`) rather than pulling from every active User org-wide. This ranking fix was itself a
+  real bug caught mid-build: OwnerId/CreatedById were initially drawn from all 105 active Users
+  org-wide, giving 91 near-random distinct owners across a 200-Case dry-run instead of a small real
+  rep pool; confirmed live against Prime_SDO this only had 8 real owners already, so the 10-cap
+  didn't need to truncate, but the underlying pool-selection fix mattered regardless.
+- Each owner in the capped pool gets exactly **one** performance tier for the whole run
+  (`_assign_rep_tiers` in `generators/cases.py`, weighted `top`/`average`/`below_average` via
+  `config.REP_PERFORMANCE_TIER_WEIGHTS`) — not re-rolled per Case, so a given rep is consistently
+  faster/slower and higher/lower CSAT across every Case they own.
+- Tier affects both close-lag speed (`config.REP_TIER_CLOSE_LAG_MULTIPLIER`, applied to the
+  priority-based mean/stddev in `_close_lag_hours`) and CSAT mean shift
+  (`config.REP_TIER_CSAT_SHIFT`, added to `config.CSAT_MEAN` before sampling).
+- Verified via direct CSV analysis of a 2,500-Case dry-run: ~20h/88 CSAT for top-tier reps vs.
+  ~32h/81 CSAT for average-tier reps.
+
+## Channel (Origin) seasonality + trend (2026-07-24)
+
+User asked for Case channel/Origin mix to have some channels naturally higher-volume than others,
+plus seasonality — distinct from the existing Case-volume seasonality (`SEASONALITY_MULTIPLIER` in
+`generators/cases.py`, which only affects *how many* Cases land in a given month, not *which
+channel* they arrive on).
+
+- `config.ORIGIN_SEASONAL_MULTIPLIER`: per-origin, per-calendar-month multiplier layered on top of
+  the base `ORIGIN_WEIGHTS` (e.g. Phone spikes 1.25-1.5x in Nov/Dec/Jan; Twitter/Facebook bump in
+  Jun-Aug; Chat dips slightly over the holidays).
+- `config.ORIGIN_TREND_RANGE`: a slower multi-month drift across the whole lookback window —
+  `(oldest_multiplier, newest_multiplier)` per origin, linearly interpolated by how far through the
+  window a given Case's `CreatedDate` falls (e.g. Phone trending down from 1.3x to 0.8x across 24
+  months, Chat trending up from 0.75x to 1.25x).
+- Both are computed per-Case in `_origin_weights_for()` and multiplied together with the base weight
+  before `weighted_choice()` picks `Origin`.
+- Verified via direct CSV analysis of a 2,500-Case dry-run: Phone spiked to 26-28% of Cases in
+  Nov/Dec/Jan vs. ~10-15% other months; a clear downward Phone trend and upward Chat trend from
+  oldest to newest month across the window.
+
+## Downstream refresh automation: Data Cloud + CRM Analytics (2026-07-24)
+
+This tool writes straight to Salesforce via Bulk API 2.0 — neither Data Cloud (which feeds Tableau
+Next) nor CRM Analytics (Service Analytics) pick up new or deleted Case/EmailMessage/CaseArticle/Task
+rows until their own ingestion/ETL runs again. User asked whether this could be automated rather than
+left as a manual Setup-UI step, and separately whether undo is trustworthy all the way through into
+Data Cloud/CRMA (i.e. can bad data be pulled back out and the process re-run cleanly). Researched both
+questions against official Salesforce docs and confirmed live against Prime_SDO before writing any
+code — see `refresh.py`.
+
+**Data Cloud data streams.** `POST /services/data/v{version}/ssot/data-streams/{id}/actions/run` is a
+documented, supported Connect REST API operation ("Run data streams") — not UI-only. It starts an
+ingestion job for one data stream (the org's per-object connectors, e.g. `Case_Home`,
+`EmailMessage_Home`, one per `SFDC`-type connector). `refresh.py`'s `find_relevant_data_streams()`
+lists all streams and filters to ones whose `connectorInfo.connectorDetails.sourceObject` is one this
+tool ever writes to (Case/EmailMessage/CaseArticle/Task) — confirmed live that Prime_SDO only actually
+has streams for `Case` and `EmailMessage`; there's no separate stream for `CaseArticle` or `Task` in
+this org, so refreshing skips them without erroring.
+
+- **No documented job-status-polling endpoint exists for data stream runs** (confirmed against the
+  full Data 360 Connect REST API reference — Data Transforms has a `run-history` sub-resource, Data
+  Streams does not). The response to `actions/run` is documented as including a `jobId`, but live
+  against Prime_SDO (API v67.0) the real response was just `{"errors": [], "success": true}` with no
+  `jobId` at all — `refresh.py` treats `jobId` as optional (`resp.json().get("jobId")`) rather than
+  assuming it's present. Because there's no reliable way to poll completion, this refresh is
+  fire-and-forget by design; a stream's own `lastRunStatus` field (`GET /ssot/data-streams/{id}`) is
+  the only observable signal, and it can stay `PENDING` for a while after the trigger — this is normal
+  Data Cloud ingestion queuing, not a failure.
+- **Hard deletes propagate on the next refresh, no full-refresh step needed.** Per Salesforce Help
+  ("Delete Ingested Records in Data 360"): for the Salesforce CRM connector specifically, "After data
+  is deleted on the source org, it's removed from Data 360 with the next incremental refresh." This
+  is what makes `undo` trustworthy into Data Cloud — a normal `actions/run` after undo is enough to
+  drop the deleted rows, not a special full-refresh mode.
+
+**CRM Analytics dataflow.** `POST /services/data/v{version}/wave/dataflowjobs` with body
+`{"command": "start", "dataflowId": "..."}` is the documented CRM Analytics REST API endpoint (also
+covers recipes — the `jobTypes` filter on the same resource lists `Recipe`/`Recipe_V3`/
+`DataCloudRecipe` as valid job types, confirmed no separate endpoint is needed). `refresh.py` looks up
+`Service_Analytics_eltDataflow`'s id via `GET /wave/dataflows`, starts it, and — unlike data streams —
+**can** poll completion via `GET /wave/dataflowjobs/{jobId}`, whose `status` field transitions
+`Queued` → `Running` → `Success`/`Failed`/`Warning`. Confirmed live: a full run completed
+(`Queued`→`Running`→`Success`) in well under a minute against Prime_SDO's actual data volume.
+
+- **Confirmed this dataflow fully rebuilds every run, not incremental.** Fetched the dataflow's own
+  `definition` JSON via the API and checked every `sfdcDigest` node's `incremental` parameter —
+  `Extract_Case`, `Extract_Task`, `Extract_CaseArticleKnowledge`, and every other node touching
+  objects this tool writes are all `incremental: false` (the default, since none of them set the
+  optional flag at all). An `sfdcDigest` node with `incremental` unset or `false` does a full
+  extraction of current source state on every run (per Salesforce Help, "sfdcDigest Parameters" /
+  "Salesforce Extract Transformation"), so a dataflow run after `undo` reflects the org's current
+  state and deleted-in-source records simply disappear from the dataset — no stale orphan rows, no
+  separate full-refresh mode needed here either.
+
+**Net effect — the loop the user asked for is fully closed and automated**: `run --live` → inspect
+dashboards → if the data's wrong, `undo --last` → `run --live` again with adjusted config, and the
+refresh step is no longer a manual Setup-UI chore in between. Both refreshes are wired into `cli.py`
+automatically after a live `run` and after `undo` (see `_refresh_downstream()`), gated by
+`--no-refresh` to skip (e.g. for fast iteration while testing generator changes) and
+`--wait-for-crma` to block until the CRMA job reaches a terminal status instead of firing and moving
+on. Both refresh calls are wrapped so a refresh failure (e.g. Data Cloud not provisioned in some
+other org) prints a warning but doesn't make an otherwise-successful load/undo look like it failed.
 
 ## Repo
 
