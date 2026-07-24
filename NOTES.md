@@ -796,6 +796,69 @@ automatically after a live `run` and after `undo` (see `_refresh_downstream()`),
 on. Both refresh calls are wrapped so a refresh failure (e.g. Data Cloud not provisioned in some
 other org) prints a warning but doesn't make an otherwise-successful load/undo look like it failed.
 
+## CRMA refresh bug: the SFDC_LOCAL replication layer (2026-07-24)
+
+After the above automation shipped and was live-tested (dataflow ran to `Success`), the user reported
+CRMA dashboards were still showing no new data, and separately flagged (via a screenshot of Data Cloud's
+Data Manager Home > Connections page) a connection named `SFDC_LOCAL` with a per-object sync table —
+`Case` shown mid-sync as `Full Sync` / `Running`. Investigated whether this was the same mechanism as
+the `ssot/data-streams` refresh already automated, or a genuinely separate layer.
+
+**Root cause confirmed live against Prime_SDO**: there are three refresh layers, not two, and the tool
+had only wired up two of them.
+
+1. **CRMA's SFDC_LOCAL connector — a local replication layer, separate from Data Cloud.** Despite
+   appearing in a Data Cloud-adjacent screenshot, this is actually a *CRM Analytics* construct:
+   `GET /wave/dataConnectors` lists it (`connectorType: "SfdcLocal"`, `description: "SFDC_LOCAL"`), and
+   `GET /wave/replicatedDatasets` shows it replicates ~70 Salesforce objects — including `Case`, `Task`,
+   `CaseArticle`, `CaseHistory` — into their own CRMA-native replicated datasets on a schedule
+   (`ingestionSchedule.frequency: "weekly"` in this org). Confirmed each replicated object has its own
+   `replicationDataflowId` (e.g. Case's is a dataflow named `Base_Extract_Case`, id
+   `02KKA000000cN2j2AE`), started/polled exactly like any other CRMA dataflow job
+   (`POST /wave/dataflowjobs {"command": "start", "dataflowId": ...}` /
+   `GET /wave/dataflowjobs/{jobId}`).
+2. **`Service_Analytics_eltDataflow` reads from that replica, not live Salesforce.** Fetched the
+   dataflow's `definition` JSON and confirmed `Extract_Case`, `Extract_Task`, and
+   `Extract_CaseArticleKnowledge` are `sfdcDigest` nodes — the same extract mechanism used everywhere
+   else in the dataflow, but its actual data source in this org is the SFDC_LOCAL replica. Running the
+   analytics dataflow without refreshing the replica first doesn't error; it just silently rebuilds the
+   CRMA dataset from whatever the replica last had. Reproduced this exactly: after the 2,500-Case load,
+   the analytics dataflow ran to completion (status `Warning` — the pre-existing, documented
+   AgentWork/Omni-Channel join warning, unrelated) but the `ServiceCase` dataset still had only 180
+   rows, because the Case replica's `lastRefreshedDate` (from the original org setup, weeks earlier) was
+   older than the new Case data.
+3. **Data Cloud's `ssot/data-streams` (already automated) is unrelated to SFDC_LOCAL.** It reads live
+   Salesforce directly and has no dependency on the CRMA replica — the two layers just happened to look
+   similar because both surface as a "Connections"-style per-object sync list in their respective
+   product UIs.
+
+**Fix**: `refresh_crma_dataflow()` in `refresh.py` now runs a new `refresh_crma_replication()` step
+first — starts the replication dataflow for every SFDC_LOCAL-replicated object this tool touches
+(`Case`, `Task`, `CaseArticle`, `CaseHistory`; found dynamically via
+`find_crma_replication_dataflow_ids()`, not hardcoded Ids, so this works in any org with the same
+connector setup), and **always waits** for each to reach a terminal status before starting the
+analytics dataflow itself (unlike the analytics dataflow's own `wait` flag, which stays
+opt-in/`--wait-for-crma`-gated for the fire-and-forget default) — starting the analytics dataflow
+before the replica has actually finished is exactly the bug that caused this, so this step isn't
+optional the way the top-level dataflow wait is.
+
+Live-verified the fix end-to-end: manually triggered the Case replication dataflow
+(`02KKA000000cN2j2AE`) via the CLI's own code path, confirmed its `lastRefreshedDate` advanced and
+`status: "success"`, then re-ran `Service_Analytics_eltDataflow` and queried the `ServiceCase` dataset
+directly via SAQL (`POST /wave/query`, `load "<datasetId>/<currentVersionId>"`) — row count went from
+180 to 2,680, matching the live Salesforce Case count exactly.
+
+`CaseHistory` is included in the replication step even though it's not one of this tool's
+`REFRESH_SOURCE_OBJECTS` for Data Cloud streams, because the Path A/B hybrid design's Path B
+status-flip update generates real `CaseHistory` rows that `ServiceCaseHistory` (feeding "Avg Time to
+1st Close") depends on — same reasoning as the rest of the Path B design, just discovered belatedly for
+the refresh step specifically.
+
+`EmailMessage` has no SFDC_LOCAL-replicated counterpart in this org (confirmed: absent from
+`GET /wave/replicatedDatasets`), so it isn't part of the replication step — this matches the earlier
+finding that `Service_Analytics_eltDataflow` has no `EmailMessage` `sfdcDigest` node at all, so there's
+nothing for a replica staleness bug to affect there.
+
 ## Repo
 
 Public repo created for this project: https://github.com/chrisprice-cmyk/service-insights-data-import

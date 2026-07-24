@@ -77,6 +77,14 @@ def _refresh_downstream(sf, wait_for_crma: bool) -> None:
 
     try:
         result = refresh_mod.refresh_crma_dataflow(sf, wait=wait_for_crma)
+        replication = result.get("replication", {})
+        if replication:
+            print("CRMA SFDC_LOCAL replication (must finish before the analytics dataflow reads current data):")
+            for source_object, r in replication.items():
+                print(f"  {source_object}: job {r['job_id']} -- {r['status']}")
+        else:
+            print("No matching CRMA SFDC_LOCAL replicated objects found -- skipping.")
+
         if result["dataflow_id"]:
             print(f"CRMA Service Analytics dataflow job {result['job_id']}: {result['status']}")
         else:

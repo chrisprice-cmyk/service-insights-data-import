@@ -117,29 +117,43 @@ Pass with `--profile <name>` on `run`. `standard` is the default.
 This tool writes straight to Salesforce via Bulk API 2.0. Neither **Data
 Cloud** (which feeds Tableau Next) nor **CRM Analytics** picks up new or
 deleted records until their own ingestion/ETL runs again — a live `run` or
-an `undo` automatically triggers both:
+an `undo` automatically triggers all of the following, in order:
 
-- **Data Cloud**: starts a run (`POST .../ssot/data-streams/{id}/actions/run`)
-  for every data stream in the org sourced from an object this tool writes
-  to (Case, EmailMessage, CaseArticle, Task). This is fire-and-forget —
-  Salesforce doesn't expose a way to poll a data stream run's completion, so
-  there's nothing to wait on. Confirmed against Salesforce's own docs that a
-  hard-deleted source record (e.g. from `undo`) is removed from Data Cloud
-  on the very next refresh — no special full-refresh step needed.
-- **CRM Analytics**: starts the `Service_Analytics_eltDataflow` dataflow
-  (`POST .../wave/dataflowjobs`). Unlike Data Cloud, this *can* be polled to
+- **CRM Analytics local replication (`SFDC_LOCAL` connector)**: some orgs
+  have a legacy CRMA connector (visible in the UI at Data Manager Home >
+  Connections) that replicates Salesforce objects — Case, Task,
+  CaseArticle, CaseHistory — into their own CRMA-native snapshot on a
+  schedule, and the Service Analytics dataflow's extract nodes read *that
+  snapshot*, not live Salesforce. Skipping this step doesn't error; it
+  silently rebuilds CRMA's dataset from stale data. This tool always
+  triggers and waits for this replication before touching the dataflow
+  below — it's not optional, since the dataflow depends on it having
+  actually finished.
+- **CRM Analytics dataflow**: starts the `Service_Analytics_eltDataflow`
+  dataflow (`POST .../wave/dataflowjobs`). This *can* be polled to
   completion — pass `--wait-for-crma` on `run --live` or `undo` to block
   until the job finishes instead of firing and moving on. This dataflow's
   Case/EmailMessage/CaseArticle/Task extracts all run as full re-extracts
   (not incremental), so deleted records disappear from the dataset the next
-  time it runs, same as Data Cloud.
+  time it runs.
+- **Data Cloud**: starts a run (`POST .../ssot/data-streams/{id}/actions/run`)
+  for every data stream in the org sourced from an object this tool writes
+  to (Case, EmailMessage, CaseArticle, Task). This is a separate ingestion
+  pipeline from the CRMA replication above — it reads live Salesforce
+  directly, with no dependency on it. It's also fire-and-forget — Salesforce
+  doesn't expose a way to poll a data stream run's completion, so there's
+  nothing to wait on. Confirmed against Salesforce's own docs that a
+  hard-deleted source record (e.g. from `undo`) is removed from Data Cloud
+  on the very next refresh — no special full-refresh step needed.
 
-Pass `--no-refresh` to skip both (useful for fast iteration while tuning
-generator config, when you don't care about dashboards updating yet).
+Pass `--no-refresh` to skip all of the above (useful for fast iteration
+while tuning generator config, when you don't care about dashboards
+updating yet).
 
-If your org doesn't have a matching data stream for some object, or doesn't
-have the Service Analytics dataflow at all, the refresh step just reports
-"not found" and skips it — it's not an error.
+If your org doesn't have the `SFDC_LOCAL` connector, a matching data
+stream for some object, or the Service Analytics dataflow at all, the
+corresponding refresh step just reports "not found"/skips it — it's not an
+error.
 
 ## Known blockers (things this tool cannot fix)
 
