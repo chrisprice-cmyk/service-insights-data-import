@@ -252,6 +252,129 @@ FIELD_INTEGRITY_EXCEPTION above).
    blocked per the two documented blockers above).
 5. Commit the working generator + docs, push to GitHub.
 
+## Calculated-fields audit (2026-07-24) — do our planned fields feed every relevant measure?
+
+Requested by user: walk every calculated measure/dimension in `Extended_Service_Insights_SDM_fd7`
+and confirm the underlying CRM fields we plan to populate actually satisfy them.
+
+**Confirmed OK, no changes needed:**
+- Escalation family (`Escalated_Cases_clc`, `Escalation_Rate_clc`, `My_Escalated_Cases_SI_clc`) →
+  `Case.Escalated` (IsEscalated). Matches plan (step 1 of fix plan).
+- FCR family (`FCR_Flag_clc`, `First_Contact_Resolution_Percentage_clc`) → `Case.Closed` +
+  `Email_Count_clc` (COUNT of related EmailMessage via `ParentId`) — fires only when a closed
+  Case has **exactly one** EmailMessage. Matches plan (step 3).
+- Cost/Speed-to-Answer/Handle-Time family → all depend on `AgentWork.ActiveTime/HandleTime/etc.`
+  — already known-blocked, no new info.
+- "Avg Time to Close" (`Avg_Time_to_Close_Hours_clc` → `BH_TimeToClose_clc`) → cleanly depends on
+  `Case.Created_Date` / `Case.Closed_Date_Time` + Operating Hours boundaries. Matches plan.
+
+**New finding — changes the generation design:**
+- "Avg Time to 1st Close" (`Avg_Time_to_1st_Close_Hours_clc` → `BH_TimeToFirstClose_clc` →
+  `First_Close_Date_clc`) is defined as:
+  `IF [Case_Update].[Status] = "Closed" THEN {FIXED [Case_Update].[Case] : MIN([Case_Update].[Previous_Update_Date])} END`
+  — i.e. it reads the **`Case_Update` DMO**, which is fed by Salesforce `CaseHistory`, not
+  `Case.ClosedDate` directly.
+- **Verified empirically (test Case created and deleted, org otherwise untouched):**
+  - Inserting a Case directly with `Status='Closed'` set at create time produces **no `CaseHistory`
+    row for the `Status` field** (only Owner/Asset/created noise rows). `First_Close_Date_clc`
+    would stay null for every Case built this way.
+  - Creating a Case as `Status='New'`, then issuing a **separate** `UPDATE Status='Closed'` DML
+    call, **does** produce a real `CaseHistory` row (`Field='Status', OldValue='New',
+    NewValue='Closed'`), which Data Cloud can sync into `Case_Update`/`Previous_Update_Date`.
+  - Also confirmed: `ClosedDate` cannot be set directly via update (`INVALID_FIELD_FOR_INSERT_UPDATE`
+    — it's system-derived once Status moves to a closed value); only settable at **insert** time.
+    So the sequence has to be: insert with `ClosedDate` pre-set (createable) + `Status='New'`, then
+    a second update flips `Status='Closed'` to generate the history row the metric needs.
+- **Design change required:** the Case generator cannot be a single Bulk API insert pass for
+  closed Cases. It needs two passes: (1) bulk insert all 2,500 Cases as Open/New with
+  `CreatedDate` and `ClosedDate` pre-set on the ones destined to be closed, (2) a second bulk
+  **update** pass that flips `Status` to the target closed value for that subset, in a separate
+  transaction, to generate the CaseHistory row `Case_Update` depends on. `CreatedDate` on the
+  update call should be left alone (already fixed by audit-field permission at insert); only
+  `Status` needs to move.
+- Note: the `CreatedDate` of the resulting `CaseHistory` row is "now" (real wall-clock time of the
+  update), not backdated — this is expected and fine; the semantic model only needs
+  `Previous_Update_Date` to exist and be resolvable per-Case, not to be historically accurate to
+  the same backdated window. Worth eyeballing this on the dashboard once loaded, but no known
+  Salesforce mechanism exists to backdate CaseHistory.CreatedDate on a plain update.
+
+**Out-of-scope family discovered (needs user confirmation, not yet actioned):**
+- A set of Knowledge-Article-attachment measures (`Cases_With_Knowledge_Attachments_SI_clc`,
+  `Case_Attachment_Rate_SI_clc`, `Knowledge_Time_To_Close_P10/P90_SI_clc`, and ~9 others) depend on
+  `Knowledge_Engagements_with_Linked_Knowledge_lv` — not part of the Cases1 tile inventory we
+  documented. Likely feeds a Knowledge/Case-Attachment view not currently in scope. Flagged, not
+  yet built or ignored by explicit agreement.
+
+## Other two dashboards in the Service Insights app (2026-07-24)
+
+Full app has 3 dashboards, all in workspace `Service_Insights1` (confirmed via
+`/services/data/v67.0/tableau/dashboards`): **Cases** (`Cases1`, already fully mapped above),
+**Omni-Channel** (`Omni_Channel1`), **My Service Performance** (`MyPerformance1`).
+
+### Omni-Channel (`Omni_Channel1`) — 58 widgets
+
+Entirely Omni-Channel/AgentWork-driven. Every metric and visualization traces back to
+`AgentWork`/Presence data: Total Work Items, Cost to Serve, Accepted/Declined Work Items, Avg
+Wait Time, Omni Utilization (+ Max), Avg Handle Time — plus visualizations for Queue by Avg
+Handle/Wait Time, Queue by Cost to Serve, Service Reps by Utilization/Handle Time/Wait Time, Work
+Volume by Status/Channel, Routing Effectiveness, Category by Time, Cost by Channel, Detailed Table.
+
+**Verdict: 100% blocked by the existing AgentWork blocker.** Case/EmailMessage generation gives
+this dashboard zero benefit. Nothing to build here until the AgentWork/Presence-scripting problem
+is solved (same blocker as Cost/FCR-cost tiles on Cases1).
+
+### My Service Performance (`MyPerformance1`) — 73 widgets
+
+A "my work" personal-performance view (filtered to the logged-in Service Rep via a Service Reps
+parameter), **genuinely hybrid**:
+
+- **Case-driven (benefits directly from our generator, same fields as Cases1):** Total Cases, Open
+  Cases, Total Cases Closed, Escalated Cases, Avg. Time to Close, Avg. Time to 1st Close, % First
+  Time Resolution, plus visualizations: Case by Channel, Case by Priority, Cases Detail Table,
+  Case Efficiency, Case Trend, Time to Close by Channel, Time to Close by Priority. (7 metrics + 7
+  visualizations.)
+- **Omni/AgentWork-driven (blocked, same as Omni-Channel dashboard):** Total Work Items, Accepted
+  Work Items, Declined Items, Avg. Wait Time, Avg. Speed to Answer, Avg. Handle Time, plus Omni
+  Efficiency Trend, Avg Handle Time vs Channel, Omni Detailed Table, Presence Status Duration, Max
+  Omni Utilization, Omni Utilization. (6 metrics + 6 visualizations.)
+
+**Verdict:** roughly half of this dashboard improves automatically once the Case/EmailMessage
+generator runs (same underlying Case data, just filtered to whichever Owner is viewing) — no
+separate work needed. The other half is blocked by AgentWork, same root cause as Omni-Channel.
+Because it filters by Owner, the generator's existing OwnerId-pool distribution (8 users) matters
+here: each rep needs a plausible personal case load, not just an even split — current design
+(reuse the real 180-Case Owner distribution) already gives that.
+
+## Reframe (2026-07-24): build for reuse by other SEs, not just Prime_SDO
+
+User's direction: this tool should work well enough that other SEs deploying the Service Insights
+app in their own orgs can pick it up and run it — not a one-off fix for Prime_SDO. Design
+implications, not yet built:
+
+- **No hardcoded org-specific IDs.** Prime_SDO-specific record Ids used so far (OwnerId pool,
+  BusinessHoursId, CreatedById pair, ServiceChannel Id, Account/Contact pairs) must become
+  **runtime lookups** against whichever org the tool is pointed at (SOQL queries at startup: active
+  Users, default BusinessHours, existing Accounts/Contacts), not constants baked into config.
+  Distribution *shapes* (percentages/weights) can stay as defaults, but the actual Ids must be
+  discovered per-org.
+- **Config-driven, not hardcoded volume/date range.** Cohort size (2,500) and lookback window (24
+  months) should be CLI flags/config values with sensible defaults, since another SE's org may
+  already have a different seed volume or want a different window.
+- **Two-step Case creation is now a required loader primitive**, not a one-off: bulk insert Open
+  Cases (with `ClosedDate` pre-set where applicable) → bulk update `Status` to closed values for
+  the target subset, per the CaseHistory finding above. The loader needs this as a built-in
+  pattern, not something re-derived by each user of the tool.
+- **Safety must be self-evident to a stranger running this against their own org**: dry-run mode
+  (CSV preview, no API calls), an explicit insert-only guarantee (never touches existing rows),
+  and a pre-flight summary (org name, existing Case count, planned insert count) with a
+  confirmation prompt before the live Bulk API run.
+- **Document the two known permanent blockers up front** (AgentWork/Omni-Channel dashboard, CSAT/
+  Survey tiles) in the README so a new SE doesn't waste time thinking the tool should have fixed
+  them — it can't, for the platform reasons documented above.
+- Needs a clear README aimed at a first-time user: prerequisites (Python 3.x, `simple-salesforce`,
+  an authenticated `sf` CLI org alias or equivalent), what the tool does/doesn't do, how to point
+  it at a different org, how to run dry-run vs live.
+
 ## Repo
 
 Public repo created for this project: https://github.com/chrisprice-cmyk/service-insights-data-import
