@@ -611,6 +611,83 @@ Suggested proactively, all four accepted for this build (not deferred):
    tiles; Survey/SurveyResponse: Tableau Next CSAT tiles only, not CRMA's `CSAT__c`-based tiles) —
    so future SEs don't have to re-derive this from scratch.
 
+## ClosedDate vs CaseHistory conflict — resolved (2026-07-24)
+
+Before writing any generator code, re-verified the two-step Case design end-to-end and found a
+real conflict between it and the original "Avg Time to Close" design, not just a re-confirmation
+of earlier findings:
+
+- **`ClosedDate` can only be set at INSERT time, and only if `Status` is already a closed value in
+  that same insert call.** Verified: inserting with `Status='New'` and `ClosedDate=<backdated>`
+  set simultaneously **silently drops** the `ClosedDate` (comes back null) — Salesforce does not
+  error, it just ignores the field.
+- **Once a Case exists, `ClosedDate` can never be set or corrected via UPDATE, under any
+  combination of fields** — confirmed again by attempting `Status='Closed'` + `ClosedDate=<backdated>`
+  together in a single UPDATE call: `INVALID_FIELD_FOR_INSERT_UPDATE` on `ClosedDate`, same error
+  as setting it alone.
+- **Flipping `Status` to Closed via UPDATE (with no ClosedDate in that call) auto-sets `ClosedDate`
+  to the real current timestamp** (confirmed again: "now" at time of test, not backdated).
+- **Net effect: the two paths are mutually exclusive per Case.**
+  - **Path A** — insert directly with `Status=<closed value>` + backdated `ClosedDate` together.
+    Gives accurate, backdated `ClosedDate` (correct "Avg Time to Close" variance). Produces **no**
+    `CaseHistory` Status row (confirmed earlier), so `Case_Update`/`First_Close_Date_clc`/"Avg Time
+    to 1st Close" stays null for these Cases.
+  - **Path B** — insert as `Status='New'`, then a later UPDATE to `Status=<closed value>`.
+    Produces a real `CaseHistory` Status row (fixes "Avg Time to 1st Close"). `ClosedDate` collapses
+    to "whenever the update ran" — not backdated, not variable per-Case, which would flatten "Avg
+    Time to Close" to a single wrong duration across every Path-B Case.
+  - Confirmed org-wide there is effectively **zero existing real Status-history data to lean on**
+    instead (`SELECT COUNT(Id) FROM CaseHistory WHERE Field='Status'` = 1, across the whole org,
+    all objects, all time) — this isn't a gap our synthetic data happens to share with the real
+    seed data, it's a genuine platform mechanic every close-flow has to contend with.
+- Also confirmed **`CaseHistory` itself has zero createable fields** (checked via describe) — there
+  is no possible direct-insert workaround; the field-history row can only ever be produced as a
+  side effect of a real field-value UPDATE.
+
+**Decision (confirmed by user 2026-07-24): hybrid split.** Most of the 2,500-Case cohort's closed
+Cases use **Path A** (direct insert with backdated `Status`+`ClosedDate` together) — this is the
+majority case and preserves accurate "Avg Time to Close" variance across the full cohort, which is
+the more heavily-used metric (appears on Cases1, My Service Performance, Service Analytics
+Overview/Backlog/Team Efficiency/Channel Review/Account Profile — i.e. most of both apps). A
+smaller, deliberately-sized subset of closed Cases instead uses **Path B** (insert Open, then a
+follow-up UPDATE to the closed Status) purely to give "Avg Time to 1st Close" some genuine
+non-null signal on both dashboards, accepting that those specific Cases' `ClosedDate` will read as
+"now" rather than a realistic backdated value. Exact subset size/ratio still to be decided during
+implementation — something in the range of 10-20% of closed Cases should be enough to populate the
+metric with real variance without meaningfully diluting the main "Avg Time to Close" trend, but
+this should be tuned by eye once dry-run output is in hand, not fixed in advance.
+
+## Undo / rollback process (2026-07-24)
+
+User asked for a way to revert/remove everything this tool deploys if something goes wrong. This
+plugs directly into the batch-tagging mechanism already agreed above (see "Additional build
+requirements," item 1) — the batch tag is what makes a clean undo possible at all, so the two are
+being designed together:
+
+- Every record the tool creates in a run (Case, EmailMessage, CaseArticle, Task) gets stamped with
+  the same batch identifier — plan: `Case.External_ID__c = 'SI-GEN-<run-id>'` on every generated
+  Case, and the related EmailMessage/CaseArticle/Task records get linked back to those Case Ids
+  (so they're findable via the Case relationship even without their own tag field).
+- A separate CLI subcommand, e.g. `python -m service_insights_data_import undo --batch SI-GEN-<run-id>`
+  (or `--last` to target the most recent run without having to look up the id), does the reverse in
+  strict dependency order: delete Task/CaseArticle/EmailMessage rows tied to the batch's Cases
+  first, then delete the Cases themselves last (deleting a Case first would cascade-orphan or block
+  on the children depending on object config — safer to go leaf-to-root).
+- **Same enforced-safety principle as the forward path**: the undo command must only ever delete
+  records it can trace back to a specific, named batch tag — never a bare "delete all Cases" or
+  anything that could reach the original 180 seed Cases (which were never tagged, since they
+  predate this tool). This makes undo the mirror image of the additive-only guarantee: the loader
+  can't touch pre-existing data going in, and undo can't touch it coming out either.
+- Every run's tool output (dry-run or live) should log the batch id clearly and, for live runs,
+  write a small local manifest file (e.g. `data/runs/<run-id>.json` — Case Ids, related record Ids,
+  timestamp, org, profile used) so `undo --last` doesn't have to depend on `External_ID__c` still
+  being intact/unmodified to find its own work; the manifest is the authoritative undo source, the
+  `External_ID__c` tag is a secondary/backup lookup path (useful if the manifest file itself is
+  lost, e.g. a fresh checkout of the repo on another machine pointed at the same org).
+- This also gives a natural non-destructive alternative to a true delete: `undo --dry-run` can
+  first print exactly what a real undo would remove, so an SE can sanity-check scope before
+  confirming, mirroring the same dry-run-first pattern used for the forward load.
+
 ## Repo
 
 Public repo created for this project: https://github.com/chrisprice-cmyk/service-insights-data-import
