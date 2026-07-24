@@ -86,6 +86,17 @@ def run_checks(sf, run_id: str) -> list:
     csat_fill_rate = (csat_filled / total * 100) if total else 0
     checks.append(Check("CSAT__c fill rate (%)", csat_fill_rate, 95, 100))
 
+    # Time_Open__c drives the "big chart" (scatter) on 4 CRMA dashboards --
+    # Service Open Cases, Service Agent Performance, Service Channel Review,
+    # Service Agent Activity. It's 0% filled on the org's original 180 seed
+    # Cases (a pre-existing gap, not this tool's to fix), so this check is
+    # scoped to only the Cases from this run.
+    time_open_filled = sf.query(
+        f"SELECT COUNT(Id) c FROM Case WHERE External_ID__c LIKE '{prefix}' AND Time_Open__c != null"
+    )["records"][0]["c"]
+    time_open_fill_rate = (time_open_filled / total * 100) if total else 0
+    checks.append(Check("Time_Open__c fill rate (%)", time_open_fill_rate, 95, 100))
+
     return checks
 
 

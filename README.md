@@ -13,6 +13,11 @@ meaningful — without ever touching data that's already in the org.
   that shifts by month and drifts over the lookback window, and a small
   capped pool of service reps with stable per-rep performance tiers (some
   reps close faster and score higher CSAT than others).
+- **Sets the CRMA-specific fields dashboards actually chart**, not just the
+  fields you'd guess from the object's obvious columns — e.g. `Time_Open__c`
+  (a real, `createable` custom field that four CRM Analytics "Service
+  Analytics" dashboards plot but is 0% filled on this org's original seed
+  data) and `CSAT__c`.
 - **Reusable.** Nothing is hardcoded to a specific org — it discovers Users,
   BusinessHours, Accounts/Contacts, and Knowledge articles at runtime via
   the target org's own data.
@@ -75,7 +80,8 @@ PYTHONPATH=src python3 -m service_insights_data_import --org <alias> verify <run
 
 Re-queries the aggregates both apps' dashboards actually use (Case volume,
 escalation rate, closed rate, FCR-eligible rate, CaseArticle/Task linkage,
-CSAT fill rate) and prints a pass/fail summary against expected ranges, so
+CSAT fill rate, Time_Open__c fill rate) and prints a pass/fail summary
+against expected ranges, so
 you can confirm the load worked without opening every dashboard by hand.
 
 ### 4. Undo
@@ -168,6 +174,14 @@ tiles to populate no matter how much Case data you load.
 | Omni-Channel dashboard, Cases1 Cost/FCR-cost tiles, "Omni" half of My Service Performance | `AgentWork`/Omni-Channel routing records can only be created by real Omni-Channel presence/routing activity, not direct insert | Tableau Next: Omni-Channel dashboard, parts of Cases1 and My Service Performance |
 | Service Omni, Service Agent Activity/Telephony Omni-adjacent tiles | Same `AgentWork` limitation | CRM Analytics: Service Omni, Service Agent Activity |
 | Tableau Next CSAT tiles specifically (not CRMA's `CSAT__c`-based tiles) | `Survey`/`SurveyResponse` records require a real survey invitation flow; direct insert isn't supported | Tableau Next only — CRMA's own CSAT tiles use the `Case.CSAT__c` field this tool does set, so those are unaffected |
+
+CRMA's "Service Open Cases", "Service Agent Performance", "Service Channel
+Review", and "Service Agent Activity" dashboards each have one large
+scatter/bubble chart plotting `Case.Time_Open__c` — a plain, `createable`
+custom field that's 0% filled on this org's original seed Cases (not a
+platform blocker, just never set by anything in the org). This tool sets it
+on every Case it generates, so those charts populate for generated data;
+the seed Cases simply won't have a point on them.
 
 ## Safety model
 

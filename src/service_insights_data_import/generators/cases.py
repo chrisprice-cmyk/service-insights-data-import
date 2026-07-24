@@ -203,7 +203,8 @@ def generate_cohort(profile, org_ctx, run_id: str, seed: int | None = None) -> C
             row["ContactId"] = contact_id
 
         closed_date = None
-        if closed and not is_path_b:
+        is_closed_now = closed and not is_path_b
+        if is_closed_now:
             lag_hours = _close_lag_hours(priority, age_hours, tier, rng)
             closed_date = created + timedelta(hours=lag_hours)
             row["Status"] = config.CLOSED_STATUS
@@ -217,6 +218,17 @@ def generate_cohort(profile, org_ctx, run_id: str, seed: int | None = None) -> C
         else:
             row["Status"] = weighted_choice(config.OPEN_STATUS_WEIGHTS, rng)
             row["First_Contact_Close__c"] = False
+
+        # CRMA's Service Open Cases / Service Agent Performance / Service
+        # Channel Review / Service Agent Activity dashboards all plot this
+        # field (via a "Time Open" duration selector) -- it's 0% filled on
+        # the existing 180 seed Cases, which is why those charts render
+        # blank today (see NOTES.md "Time_Open__c"). Mirrors the dataflow's
+        # own duration logic (compute_CalculatedCaseDuration): closed Cases
+        # get wall-clock CreatedDate->ClosedDate days, open Cases get
+        # CreatedDate->now days. Field scale is 0 (whole days), hence round().
+        duration_days = ((closed_date if is_closed_now else now) - created).total_seconds() / 86400.0
+        row["Time_Open__c"] = round(duration_days)
 
         cohort.insert_rows.append(row)
         cohort.seqs.append(seq)

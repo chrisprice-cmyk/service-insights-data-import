@@ -859,6 +859,94 @@ the refresh step specifically.
 finding that `Service_Analytics_eltDataflow` has no `EmailMessage` `sfdcDigest` node at all, so there's
 nothing for a replica staleness bug to affect there.
 
+## CRMA "big chart" blank on 4 dashboards: the `Time_Open__c` gap (2026-07-24)
+
+After the SFDC_LOCAL replication fix above shipped, the user shared screenshots of 4 CRMA
+dashboards (Service Open Cases, Service Agent Performance, Service Channel Review, Service Agent
+Activity) where every KPI/donut tile had data, but each page's one large scatter/bubble chart was
+still blank ("No valid data to display"). Fetched all 4 dashboards' full `state` JSON
+(`GET /wave/dashboards/{id}`) and traced each blank chart's widget → step → any `{{column(...)}}`
+template substitution back to its underlying field:
+
+- Service Open Cases: `chart_Id_2` ("Cases with long duration and no activity") → step `Id_2` →
+  `sum('{{column(Static_Duration.selection, ["pigql_value"]).asObject()}}')` → resolves to
+  `Time_Open__c`.
+- Service Agent Performance: `chart_agent_by_avg_duration_avg_csat` → same `Static_Duration`
+  control → `avg(Time_Open__c)` + CSAT, grouped by Owner/Role.
+- Service Channel Review: `chart_origin_by_csat_duration` → same `Static_Duration` control →
+  `avg(Time_Open__c)` + CSAT, grouped by Origin.
+- Service Agent Activity: `chart_scatter_activity_per_case` → SAQL literally embeds
+  `avg('Case.{{column(Static_Duration.selection, ["value"]).asObject()}}')` → `Case.Time_Open__c`,
+  on the `ServiceActivity` dataset (still joins back to `Case`).
+
+**All 4 resolve to the exact same field**, `Case.Time_Open__c` — a real, plain (`calculated: false`)
+custom `double` field, `createable=true`/`updateable=true` (confirmed via describe). It was **0%
+filled on all 2,680 Cases**, including the original 180 seed Cases (`SELECT COUNT(Id) c FROM Case
+WHERE Time_Open__c != null` = 0) — a pre-existing org gap the generator hadn't been setting, not
+something the SFDC_LOCAL fix broke. SAQL's `sum()`/`avg()` over an all-null field drops the output
+key entirely rather than returning 0, which is why the chart has literally nothing to plot rather
+than plotting zeroes.
+
+Checked for any Flow/Apex/scheduled job in the org that might set `Time_Open__c` on Case save —
+none found (SOSL search across ApexClass/ApexTrigger bodies for `Time_Open__c` returns only
+`ServiceWaveConfigurationModifier`, a CRMA template-install helper that wires the dashboard's
+"CaseDuration" variable to read `Case.Time_Open__c` — i.e. confirms this is the field the templates
+were *designed* to read, but nothing in the org ever populates it). Two sibling fields also exist on
+Case (`CreatedDate__c`, `ClosedDate__c`) and are similarly 0% filled — already documented above as
+"leave null, likely unused legacy template fields" — but neither is referenced by any of these 4
+dashboards' widgets, so no action needed there.
+
+**Fix**: `generators/cases.py` now sets `Time_Open__c` on every generated Case, computed the same
+way the dataflow's own `compute_CalculatedCaseDuration` node computes case duration elsewhere
+(`compute_CalculatedCaseDuration` reads `case when IsClosed then (ClosedDate-CreatedDate)/86400 else
+(CurrentDate-CreatedDate)/86400 end`) — closed Cases get `(ClosedDate - CreatedDate)` in days, open
+Cases get `(now - CreatedDate)` in days, rounded to a whole number to match the field's `scale: 0`.
+This only ever touches Cases this run creates — the 180 seed Cases stay untouched and will simply
+have no point on these 4 charts, consistent with the additive-only rule. Verified via a `quick`
+profile dry-run: 200/200 generated Cases got a non-negative `Time_Open__c` value (range 0–90 days,
+avg ~13.5), with closed-Case values matching `ClosedDate - CreatedDate` exactly and open-Case values
+matching `now - CreatedDate`.
+
+`verify.py` gained a new check, `Time_Open__c fill rate (%)`, scoped to `External_ID__c LIKE
+'<run_id>%'` (not org-wide) so it doesn't flag the seed Cases' pre-existing gap as this run's
+problem.
+
+### CSAT — already solved for CRMA, still blocked for Tableau Next
+
+The user separately asked what else could be done about CSAT. Re-confirmed: this was already fully
+solved for the CRMA track earlier in the build (see "CSAT — resolved cleanly" above) —
+`Case.CSAT__c` is a plain createable Number field, and the generator has set it on 100% of generated
+Cases since the original build (spot-checked live: 2,500/2,500 generated Cases have `CSAT__c`
+non-null, mean ~78.4, matching the configured `CSAT_MEAN`/`CSAT_STDDEV` distribution). None of the 4
+dashboards' CSAT tiles are blank for a CSAT-specific reason — the KPI tile
+(`kpi_avg_csat`: `avg(CSAT) where IsClosed=true`) and the scatter charts' CSAT axis both read
+straight from `CSAT__c`, so they render correctly once there are enough closed Cases. The remaining
+CSAT gap is exclusively on the **Tableau Next** side (Service Insights app's CSAT tiles), which read
+through Salesforce Feedback Management's `Survey`/`SurveyResponse` chain — every field on
+`SurveyResponse`/`SurveyQuestionResponse` is `createable=false`/`updateable=false`, so it can't be
+bulk-seeded the way Case fields can (see the original blocker section above). That remains a
+documented, unresolved limitation, not something this session's fix touches.
+
+**New lead, not yet resolved**: re-researched official docs and found Salesforce *does* publish a
+supported Connect REST API meant to programmatically drive a survey response to completion without
+a live UI session or existing invitation — `POST` then `PATCH
+/connect/surveys/{surveyId}/survey-response` (inline `invitationSettings` on the POST creates the
+invitation on the fly; the PATCH submits `surveyPageResponses` to complete it), documented at
+https://developer.salesforce.com/docs/atlas.en-us.chatterapi.meta/chatterapi/connect_resources_create_submit_surveys.htm.
+This is a materially different finding from the original "every field is createable=false, no
+supported API" blocker above — the object fields are still non-createable, but this endpoint is a
+sanctioned side door around that. **Tried it live against Prime_SDO's actual CSAT survey**
+(`SDO_Service_Case_Survey`, id `0KdKA000000Cadq0AC` — already used for this org's 164 real
+`SurveyInvitation`/`SurveySubject` rows) with a real Contact as the recipient: rejected with
+`INVALID_INPUT_COMBINATION` / `"is an invalid survey ID. Specify the ID of a basic or conversational
+survey."` (no record was created — this was a read-only probe). Checked `Survey.SurveyType` across
+all 10 surveys in this org: every one reports `"Survey"`, not `"basic"`/`"conversational"` — this
+looks like a survey-type/edition mismatch specific to how these Surveys were set up, not proof the
+endpoint can never work here. **Not pursued further this session** (deferred by user 2026-07-24) —
+worth revisiting: try against a freshly-created test Survey explicitly configured as a "basic"
+type, or check whether "basic/conversational" is a Feedback Management licensing tier this org
+simply doesn't have enabled.
+
 ## Repo
 
 Public repo created for this project: https://github.com/chrisprice-cmyk/service-insights-data-import
