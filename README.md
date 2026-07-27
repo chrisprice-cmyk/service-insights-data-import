@@ -161,6 +161,143 @@ stream for some object, or the Service Analytics dataflow at all, the
 corresponding refresh step just reports "not found"/skips it — it's not an
 error.
 
+## Deploying to a new org
+
+This is the checklist an SE should follow end-to-end the first time they
+point this tool at a new org — not just running the generator, but
+confirming both dashboard apps actually render afterward. Everything below
+was worked out live against two separate orgs (`Prime_SDO`, then
+`Probation_Digital`); full technical detail and the exact API calls behind
+each step are in `NOTES.md` if you need to go deeper than this summary.
+
+### 1. Prerequisites checklist
+
+Before the first run against a new org, confirm:
+
+- [ ] `Case.External_ID__c` exists (custom, createable, `unique=true`) — see
+  [Prerequisites](#prerequisites) above. The tool will fail loudly on the
+  first insert if this is missing.
+- [ ] `Case.Time_Open__c` and `Case.CSAT__c` exist and are createable — both
+  are plotted by CRM Analytics "Service Analytics" dashboards.
+- [ ] `Task.LastModifiedDate__c` exists and is createable — CRMA's
+  "Number_Days Since Last Activity" metric depends on it (see step 3 below
+  for what happens if it's missing or the dataflow doesn't prefer it).
+- [ ] The CRM Analytics "Service Analytics" app (dataflow + dashboards) is
+  already installed on the org. This tool refreshes an existing dataflow; it
+  does not install the app itself.
+- [ ] If you also care about Tableau Next: the "Service Insights" app is
+  already provisioned (Setup → check for a workspace built from the
+  `sfdc_internal__ServiceInsights` template). Same story — this tool doesn't
+  install it.
+- [ ] **Each org has its own copy** of the dataflow, dashboards, and any
+  live patches applied to them (different `02K...`/dashboard Ids per org).
+  A fix applied to one org's live definition does nothing for any other org
+  — steps 3–4 below need to be repeated per org, not just once ever.
+
+### 2. Dry run → live run → verify
+
+```bash
+# 1. Dry run first, always — inspect the CSVs under data/dry-runs/ before touching the org
+PYTHONPATH=src python3 -m service_insights_data_import --org <alias> run --profile quick
+
+# 2. Live run. --yes skips the confirmation prompt (needed for CI/scripted use).
+#    --wait-for-crma blocks until the CRMA dataflow job finishes instead of
+#    firing and moving on -- use it here so step 3 has a job to inspect.
+PYTHONPATH=src python3 -m service_insights_data_import --org <alias> run --profile quick --live --yes --wait-for-crma
+
+# 3. Verify
+PYTHONPATH=src python3 -m service_insights_data_import --org <alias> verify <run_id>
+```
+
+Use the `quick` profile (200 Cases) for this first pass on a new org — it's
+enough to prove the pipeline end-to-end without waiting on a large load.
+Re-run with `standard` or `enterprise` once you've confirmed the checks
+below pass.
+
+### 3. Check for the two known CRMA symptoms
+
+The live run's output prints the CRMA dataflow job status. `Warning` is
+**not** automatically a problem — this dataflow throws benign warnings on
+some orgs (e.g. LiveChatTranscript, Knowledge__kav, or Opportunity join
+warnings unrelated to Case data) — so don't treat the status alone as a
+signal. Instead, check for these two specific symptoms after the run:
+
+- **"Service Open Cases" dashboard's scatter/bubble chart is blank or shows
+  almost no points.** Root cause: on some orgs, CRMA's SAQL sorts `null`
+  values to the front on `order by desc`, so Cases with a null
+  `Time_Open__c` (typically pre-existing seed data) fill the chart's
+  `limit` entirely and crowd out real rows.
+- **`sum_last_activity` / "Number_Days Since Last Activity" clusters near
+  0 or 0.01 for every row**, instead of showing a spread of values. Root
+  cause: `Case.LastModifiedDate` and `Task.LastModifiedDate` are
+  system-managed fields — Salesforce silently ignores any backdated value
+  sent on insert, so a dataflow node computing "days since last activity"
+  from the raw field sees everything as just-modified.
+
+Confirm with a direct query rather than trusting the dashboard tile alone:
+query the CRMA dataset (`ServiceCase` or equivalent) for the affected
+metric and check for a spread of values. **Before you conclude either bug
+is present, re-fetch the dataset's current `currentVersionId`
+(`GET /wave/datasets?q=<name>`)** — every dataflow run changes it, and
+querying a stale version returns a snapshot from *before* the run, which
+looks identical to these bugs but isn't. This cost real time to debug
+twice; don't skip it.
+
+### 4. If either symptom is genuinely present
+
+There is no automated fix command for this yet — these are manual,
+per-org, live edits against the dataflow/dashboard definitions via the
+CRM Analytics REST API. Broad shape of the fix, in order:
+
+1. **Back up first.** `GET` the current live dataflow (`/wave/dataflows/{id}`)
+   and/or dashboard (`/wave/dashboards/{id}`) definition and save the raw
+   JSON under `data/dataflow-backups/<OrgAlias>_<what>_<date>_pre_<fix>.json`
+   before changing anything.
+2. **Null-sort-order fix (scatter chart)**: in the dashboard's step that
+   plots `Time_Open__c` (look for a `pigql` query with `order q by ...` and
+   `limit q ...` referencing `Total_Duration`), insert a filter immediately
+   before the order/limit: `q = filter q by 'Total_Duration' >= 0;`. Then
+   `PATCH /wave/dashboards/{id}` with the edited `state`.
+3. **`sum_last_activity` clustering fix**: find the dataflow node(s) that
+   compute days-since-last-activity from `LastModifiedDate_sec_epoch` (look
+   in `computeJoin_*` nodes feeding the Case/Task register step) and swap
+   the reference to a real per-record timestamp that isn't system-managed —
+   on the orgs seen so far, a `LastModifiedDate__c` shadow field on Task
+   (already preferred by the dataflow's own extract node when populated)
+   covers the Task side for free once the generator sets it; the Case side
+   needs the dataflow's fallback SAQL literally repointed at
+   `CreatedDate_sec_epoch` instead. Then `PATCH /wave/dataflows/{id}`
+   (add `?wave.syncConfigCleanup=Cleanup` if the PATCH is rejected for a
+   deprecated `"incremental"` property).
+4. **Watch for HTML entity escaping.** Both `GET` responses above return
+   HTML-entity-encoded text (`&#39;` for `'`, etc.) — recursively
+   `html.unescape()` the whole tree before editing, or re-escape on the way
+   back out, or unrelated nodes will double-escape and break.
+5. **Redeploy and re-run** the dataflow (or trigger it via a fresh `run
+   --live --wait-for-crma`), then re-verify per step 3 above — using a
+   freshly re-fetched dataset version, not the one you started with.
+
+Full worked examples of both fixes (exact SAQL/pigql diffs, the specific
+node names patched on each org so far) are in `NOTES.md`.
+
+### 5. Confirm the Tableau Next side, if in scope
+
+If the org also needs Tableau Next's "Service Insights" app:
+
+- Confirm the app is provisioned: `GET /services/data/v{ver}/tableau/dashboards`
+  should list dashboards with `templateSource.name` =
+  `sfdc_internal__ServiceInsights`.
+- Confirm Data Cloud is actually ingesting, not just fired-and-forgotten:
+  `GET /services/data/v{ver}/ssot/data-streams` and check `lastRefreshDate`
+  / `lastRunStatus` for `Case_Home`, `CaseHistory2_Home`,
+  `EmailMessage_Home` (or whichever streams your org has) — a recent
+  timestamp with `SUCCESS` confirms the pipeline actually ran, not just that
+  this tool asked it to.
+- Cross-check against the [Known blockers](#known-blockers-things-this-tool-cannot-fix)
+  table below — Omni-Channel and Tableau Next CSAT tiles will stay blank on
+  every org regardless of data volume; that's expected, not a failure of
+  this checklist.
+
 ## Known blockers (things this tool cannot fix)
 
 Some dashboard tiles in both apps depend on objects that **cannot be
