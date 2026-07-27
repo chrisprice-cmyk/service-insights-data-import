@@ -1056,6 +1056,33 @@ Both live changes are reversible: pre-change snapshots saved at
 those files (they're already in raw/unescaped form as returned by `GET`, so they'd need the same
 `html.unescape()` treatment as any other GET response before re-sending).
 
+## Tested against a second org, `Probation_Digital` (2026-07-27)
+
+Ran the full tool (dry run, then a live `quick`-profile insert) against a second org with the same
+Service Analytics template installed, to confirm the generator and the two dashboard/dataflow fixes
+above aren't Prime_SDO-specific. Confirmed the required custom fields (`External_ID__c`,
+`Time_Open__c`, `CSAT__c`, `Task.LastModifiedDate__c`) already existed there too, so no setup was
+needed beyond `sf org login`. The generator itself worked cleanly first try — 200 Cases, `verify`
+all-PASS.
+
+**Important finding: the dataflow's `sum_last_activity`/null-sort-order bugs are per-org, not
+shared.** Every org with its own copy of the Service Analytics template has its own dataflow and
+dashboard definitions (confirmed different Ids: `02KKB000000j86Q2AQ` vs Prime_SDO's
+`02KKA000000cN2b2AE`) — patching one org's copy does nothing for another org's. Reapplied the exact
+same two live patches here (Case-fallback SAQL token swap + dashboard `>= 0` filter), with the same
+backup-before-change discipline (`data/dataflow-backups/Probation_Digital_*_20260727_*.json`).
+Verified live the same way: all 41 generated open Cases now get fully distinct
+`sum_last_activity` values (cross-checked one by hand against its Task's real `LastModifiedDate__c`
+— 83.05 computed vs 83.07 expected, agreeing to rounding), and the scatter chart's `Id_2` query
+returns 100/100 non-null rows.
+
+**Takeaway for onboarding a new org**: this tool's Python-side generator is fully portable
+(`--org <alias>` is the only thing that changes), but the two CRMA-side fixes documented above are
+**not** part of any automated deploy step — they're live edits to that org's own dataflow/dashboard
+JSON. If a new org's Service Analytics dashboards show the same symptoms (scatter chart blank, or
+"Number_Days Since Last Activity" clustering near 0), the same two patches need to be hand-applied
+there too, following this same diagnose-backup-patch-verify sequence.
+
 ## Repo
 
 Public repo created for this project: https://github.com/chrisprice-cmyk/service-insights-data-import
