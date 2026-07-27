@@ -947,6 +947,115 @@ worth revisiting: try against a freshly-created test Survey explicitly configure
 type, or check whether "basic/conversational" is a Feedback Management licensing tier this org
 simply doesn't have enabled.
 
+## Two more CRMA bugs fixed live: `sum_last_activity` clustering + null-sort-order (2026-07-27)
+
+Picked back up the two bugs diagnosed at the end of the 2026-07-24 session (see their write-up
+above under "Two remaining known bugs" — same root causes, now both fixed and verified live). Per
+the user's explicit instruction, a full pre-change JSON backup of both the dataflow and the "Service
+Open Cases" dashboard was saved under `data/dataflow-backups/` before either was touched, so both
+can be reverted with a straight `PATCH` of the backup file if needed.
+
+### Bug: `sum_last_activity` / "Number_Days Since Last Activity" clustered at 0/0.01
+
+Root cause confirmed exactly as suspected on 2026-07-24: `Case.LastModifiedDate` and
+`Task.ActivityLastModifiedDate` are system-managed and always stamp to the real DML time, even on
+insert — a backdated value sent for either is silently dropped by Salesforce. Two more things came
+to light while implementing the fix that change the shape of it from what was planned on 2026-07-24:
+
+- This org already has a **custom shadow field**, `Task.LastModifiedDate__c` (`createable`,
+  `updateable`, datetime) — and the dataflow's own extract node
+  (`Extract_Task_get_Demo_Data_rename_fields`) **already prefers it** over the real
+  `LastModifiedDate` when populated (`case when 'LastModifiedDate__c' != "" then
+  toDate('LastModifiedDate__c', ...) else toDate('LastModifiedDate', ...) end`). So the Task side of
+  the fix didn't need any SAQL rewrite at all — just populating a field that was already sitting
+  there unused. `Case` has no equivalent shadow field, so its fallback branch (used only when a Case
+  has no Task/Event) still needed a direct SAQL edit.
+- The `sum_last_activity` computed field exists in **two** dataflow nodes —
+  `computeJoin_ServiceCaseTaskEvent` (Task+Event join) and `computeJoin_ServiceCaseTask` (Task-only,
+  no Event join). Traced both forward through the node graph to `Register_Case`: only
+  `computeJoin_ServiceCaseTaskEvent` is actually wired to a registered dataset (`ServiceCase`) —
+  `computeJoin_ServiceCaseTask` is an orphan branch nothing else references. Patched both anyway for
+  consistency, but only the Event-joined node's fix is load-bearing.
+
+**Fix, in order**:
+1. `generators/tasks.py` now sets `Task.LastModifiedDate__c = activity_date.isoformat()` on every
+   Task row (same value as `CreatedDate`) — permanent, so every future run is correct without any
+   backfill step. This is the field the dataflow already reads preferentially.
+2. Backfilled the 897 already-live Tasks (run `20260724-195921`) with `LastModifiedDate__c` set to
+   each Task's own `CreatedDate`, via a `BatchGuard`-scoped bulk UPDATE limited to the 897 known Ids
+   from that run's manifest (the guard's registered-Ids allowlist, previously only exercised for
+   Path B Case status-flips, applied here for the first time to a Task field). 897/897, 0 failures.
+3. Patched the dataflow's Case-only fallback branch (both `computeJoin_ServiceCaseTaskEvent` and
+   `computeJoin_ServiceCaseTask` nodes' `sum_last_activity` SAQL): the bare `'LastModifiedDate_sec_epoch'`
+   token → `'CreatedDate_sec_epoch'` (careful not to touch the prefixed
+   `'Task.ActivityLastModifiedDate_sec_epoch'`/`'Event.ActivityLastModifiedDate_sec_epoch'` tokens,
+   which share a substring). Also relabeled the computed field to "Days Since Last Activity" for
+   clarity.
+4. Redeployed via `PATCH /wave/dataflows/{id}?wave.syncConfigCleanup=Cleanup` (see gotchas below),
+   then ran the full 3-layer refresh chain (`refresh.refresh_crma_dataflow(sf, wait=True)`) — all
+   steps returned Success, not the prior run's Warning.
+
+**Verified live**: re-fetched `ServiceCase`'s new `currentVersionId` post-refresh and ran the exact
+`sum('sum_last_activity')` SAQL directly — 388 distinct values now, range 2.95–722.14 days, instead
+of the prior 0.01/0 clustering. The 128 seed Cases (no generated Task/Event) still cluster at one
+shared value (32.52 days) — expected, matches the established pattern of not backfilling
+pre-existing seed-data gaps.
+
+### Bug: null-sort-order stacking every null `Time_Open__c` row to the front of a `limit q 100`
+
+Confirmed still live exactly as diagnosed 2026-07-24: this org's CRMA SAQL engine sorts nulls to the
+*front* on `order by ... desc`, and the "Service Open Cases" dashboard's `Id_2` scatter-chart step
+does `order by ('Total_Duration' desc, ...); limit q 100` with no null filter — so all 100 seed
+Cases with a null `Time_Open__c` won the sort and the chart got zero real rows even with 387 valid
+ones just outside the slice.
+
+Tried `'Total_Duration' != null` and `== null` directly against the dataset first — **both returned
+0 rows**, an unexpected engine quirk (not normal boolean-filter behavior). `not isnull(...)` errored
+outright ("Function isnull not supported" — doesn't exist in this SAQL dialect). The fix that
+actually works, verified live: a numeric range filter, `'Total_Duration' >= 0` (chosen over `> 0`,
+which would incorrectly exclude a legitimate exactly-zero-duration Case) — added immediately before
+the existing `order`/`limit` lines in the `Id_2` step's `pigql`.
+
+Checked the 3 sibling dashboards flagged as likely-affected on 2026-07-24 (Service Agent
+Performance, Service Channel Review, Service Agent Activity) — **none actually have this bug**.
+Their `Time_Open__c`/`Static_Duration`-dependent steps either aggregate by Owner/Origin (a small,
+capped group set) with `limit 2000`, or wrap the average in `coalesce(avg(...), 0)`, which already
+neutralizes nulls before any sort happens. No changes needed there; they picked up the
+`sum_last_activity` dataflow fix automatically since that fix is dataflow-wide, not dashboard-specific.
+
+**Verified live**: reproduced the widget's exact `pigql` (with the `Time_Open__c`/`Static_Duration`
+placeholder resolved manually, since the dashboard's `{{column(...)}}` templating only resolves in
+the actual UI) directly against `ServiceCase` — 100/100 rows returned, 0 nulls, values ranging up to
+722 days, matching the `sum_last_activity` fix above.
+
+### Gotchas hit patching the dataflow/dashboard via REST (useful for next time)
+
+- **`GET` responses are HTML-entity-encoded**; `PATCH` expects raw characters. Editing the string
+  in place and sending it straight back double-escapes it, which silently corrupts *other*,
+  untouched nodes' filter conditions elsewhere in the same definition (surfaced as cryptic
+  `parseSingleWhere failed predicate` / `unexpected token: '&'` errors, error code 239, on nodes I
+  never touched — Knowledge__kav/Group/CaseHistory__c extracts, in this case). Fix: recursively
+  `html.unescape()` every string in the whole definition/state tree before editing anything, so the
+  edit lands on raw text and the PATCH body is raw throughout.
+- Dataflow PATCH additionally needs `?wave.syncConfigCleanup=Cleanup` on the URL if the definition
+  still has the deprecated `"incremental"` property on any `sfdcDigest` node (error 603 otherwise).
+- Dashboard PATCH's `DashboardInput.state` doesn't accept every field the matching `GET` returns —
+  any object carrying a **`"url"` key** (dataset/folder/file references throughout `state`) and any
+  dataset-reference object shaped exactly `{"id", "name", "label"}` inside a step's `datasets` list
+  must be stripped before sending, or it 400s with `JSON_PARSER_ERROR` pointing at the offending
+  key. Both are server-populated read-only fields on read, not accepted on write.
+- After any dataflow re-run, the dataset's `currentVersionId` changes — re-fetch
+  `GET /wave/datasets?q=<name>` before running a verification SAQL query, or you'll query the stale
+  version and get misleadingly unchanged results (hit this once this session, caught it by noticing
+  the numbers hadn't moved at all and re-checking the version Id).
+
+Both live changes are reversible: pre-change snapshots saved at
+`data/dataflow-backups/Service_Analytics_eltDataflow_20260727_pre_lastactivity_fix.json` and
+`data/dataflow-backups/ServiceOpenCases_dashboard_20260727_pre_nullfilter_fix.json` — to revert,
+`PATCH` the dataflow/dashboard with `{"definition": ...}`/`{"state": ...}` taken straight from
+those files (they're already in raw/unescaped form as returned by `GET`, so they'd need the same
+`html.unescape()` treatment as any other GET response before re-sending).
+
 ## Repo
 
 Public repo created for this project: https://github.com/chrisprice-cmyk/service-insights-data-import

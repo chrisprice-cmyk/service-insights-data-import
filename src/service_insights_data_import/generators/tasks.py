@@ -27,6 +27,15 @@ def build_rows(cohort, case_ids_by_seq: dict, org_ctx, rng_seed: int | None = No
             "Subject": "Call",
             "ActivityDate": activity_date.date().isoformat(),
             "CreatedDate": activity_date.isoformat(),
+            # LastModifiedDate itself is system-managed and always stamps to
+            # the real insert time -- Salesforce silently ignores any value
+            # sent for it, confirmed via live probe inserts against
+            # Prime_SDO. This custom shadow field IS createable/updateable,
+            # and the dataflow's own Extract_Task_get_Demo_Data_rename_fields
+            # node already prefers it over the real LastModifiedDate when
+            # populated (see NOTES.md "sum_last_activity" section) -- it's
+            # what drives CRMA's "Number_Days Since Last Activity" metric.
+            "LastModifiedDate__c": activity_date.isoformat(),
             "Status": "Completed",
             "Priority": "Normal",
             "TaskSubtype": "Call",
