@@ -2,5 +2,4 @@ __pycache__/
 *.pyc
 .venv/
 data/dry-runs/
-data/runs/*.json
-!data/runs/.gitkeep
+data/runs/
