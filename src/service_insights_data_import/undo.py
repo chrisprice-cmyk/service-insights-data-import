@@ -9,7 +9,6 @@ structurally incapable of reaching a record the manifest doesn't list
 were never in any manifest).
 """
 
-from .batch import run_prefix
 from .manifest import RunManifest, latest_run_id
 from .safety import BatchGuard
 
@@ -48,11 +47,3 @@ def execute(sf, run_id: str) -> RunManifest:
         guard.guarded_delete(sf, "Case", manifest.case_ids)
 
     return manifest
-
-
-def find_orphaned_batch_case_ids(sf, run_id: str) -> list:
-    """Secondary/backup lookup path (per NOTES.md) for when the manifest file
-    itself is missing -- finds Cases via the External_ID__c batch tag
-    instead. Not used unless the manifest can't be loaded."""
-    result = sf.query(f"SELECT Id FROM Case WHERE External_ID__c LIKE '{run_prefix(run_id)}'")
-    return [r["Id"] for r in result["records"]]

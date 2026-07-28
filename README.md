@@ -353,10 +353,12 @@ the seed Cases simply won't have a point on them.
   UPDATE or DELETE a record it didn't itself register earlier in the same
   run (or load from that run's manifest, for `undo`) — not just documented
   intent, an actual runtime assertion.
-- `data/runs/<run_id>.json` is the authoritative source for `undo`; the
-  `External_ID__c` tag is a secondary/backup lookup path if the manifest
-  file itself is ever lost (e.g. a fresh checkout on another machine).
+- `data/runs/<run_id>.json` is the sole source `undo` reads from — if a
+  manifest is lost (e.g. a fresh checkout on another machine), that run's
+  records can no longer be undone by this tool, though the `External_ID__c`
+  tag on each record (`SI-GEN-<run_id>-<seq>`) still lets you find and
+  manually clean them up via SOQL if needed.
 
 ## License
 
-TBD.
+MIT — see [LICENSE](LICENSE).

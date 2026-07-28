@@ -31,16 +31,3 @@ def run_prefix(run_id: str) -> str:
     return f"{BATCH_PREFIX}{run_id}-%"
 
 
-def any_batch_prefix() -> str:
-    """The SOQL LIKE prefix that finds every Case this tool has ever created."""
-    return f"{BATCH_PREFIX}%"
-
-
-def run_id_from_external_id(external_id: str) -> str | None:
-    """Recover the run_id from a Case's External_ID__c value, or None if it
-    doesn't look like one of ours."""
-    if not external_id or not external_id.startswith(BATCH_PREFIX):
-        return None
-    remainder = external_id[len(BATCH_PREFIX):]
-    run_id, _, _seq = remainder.rpartition("-")
-    return run_id or None

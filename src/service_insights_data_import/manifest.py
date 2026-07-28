@@ -1,10 +1,10 @@
-"""Run manifests: the authoritative undo source.
+"""Run manifests: the sole undo source.
 
-Per NOTES.md "Undo / rollback process", the manifest file is authoritative
-for undo -- it doesn't depend on External_ID__c surviving untouched. The
-batch tag (see batch.py) is kept only as a secondary/backup lookup path for
-when the manifest itself is missing (e.g. a fresh checkout on another
-machine pointed at the same org).
+Per NOTES.md "Undo / rollback process", the manifest file is the only
+thing `undo` reads from. If it's missing (e.g. a fresh checkout on
+another machine), that run can't be undone by this tool -- the
+External_ID__c batch tag (see batch.py) still identifies the records for
+manual cleanup, but there's no automated fallback lookup.
 """
 
 import json

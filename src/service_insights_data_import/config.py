@@ -7,7 +7,7 @@ Contact Ids, etc.) are never hardcoded here -- see org_context.py, which
 discovers them at runtime so this tool works against any org.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
