@@ -22,6 +22,29 @@ meaningful — without ever touching data that's already in the org.
   BusinessHours, Accounts/Contacts, and Knowledge articles at runtime via
   the target org's own data.
 
+## At a glance: what this solution does, step by step
+
+1. **Generate** — build a realistic Case cohort (plus related
+   EmailMessage/CaseArticle/Task rows) in memory, seeded from the target
+   org's own Users/BusinessHours/Accounts/Contacts/Knowledge articles. See
+   [Usage → Dry run](#1-dry-run-default--inspect-before-touching-the-org).
+2. **Load** — insert that cohort into Salesforce via Bulk API 2.0, tagged
+   with a per-run `External_ID__c` so it can be identified and undone later.
+   See [Usage → Live run](#2-live-run--actually-insert).
+3. **Refresh downstream** — trigger CRM Analytics' local replication, then
+   its Service Analytics dataflow, then Data Cloud's data streams, so the
+   newly inserted records actually reach both dashboard apps instead of
+   sitting unseen in core Salesforce. See [Downstream refresh](#downstream-refresh).
+4. **Verify** — re-query the aggregates the dashboards actually chart and
+   check them against expected ranges, so you know the load worked without
+   opening every dashboard by hand. See [Usage → Verify](#3-verify).
+5. **(First time on a new org only) Confirm both dashboard apps render** —
+   a one-time checklist per org to catch two known CRMA quirks and confirm
+   Tableau Next is actually ingesting. See [Deploying to a new org](#deploying-to-a-new-org).
+6. **Undo, if needed** — remove exactly what a given run created,
+   leaf-to-root, and re-trigger the same downstream refresh so deleted rows
+   drop out of Data Cloud and CRM Analytics too. See [Usage → Undo](#4-undo).
+
 ## Prerequisites
 
 - Python 3.11+
