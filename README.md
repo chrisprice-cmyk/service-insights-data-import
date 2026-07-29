@@ -57,6 +57,36 @@ meaningful — without ever touching data that's already in the org.
   `unique=true`) — this is what every generated record is tagged with. If
   your org doesn't have it, create it before running.
 
+## Required app setup (not installed by this tool)
+
+This tool only generates and inserts Case-family data, then refreshes
+*existing* CRM Analytics and Data Cloud pipelines — it never installs an app,
+a dataflow, a semantic model, or a Data Cloud data kit. Both dashboard apps
+below need to already be set up on the target org before you run this tool,
+or there's nothing for the refresh step to feed into.
+
+- **CRM Analytics "Service Analytics"** — the app (dataflow + dashboards)
+  must already be installed. This tool starts the existing
+  `Service_Analytics_eltDataflow` dataflow; it does not create it.
+- **Tableau Next "Service Insights"** — the app must already be provisioned
+  (Setup → check for a workspace built from the `sfdc_internal__ServiceInsights`
+  template), **and** Data Cloud's **Service Data Kit** must already be
+  installed and mapped on the org. The Service Insights template's semantic
+  model reads through Data Cloud DMOs that only exist once the Service Data
+  Kit has provisioned its underlying data streams (`Case_Home`,
+  `CaseHistory2_Home`, `EmailMessage_Home`, etc. — see
+  [Downstream refresh](#downstream-refresh)). If the data kit isn't
+  installed, those streams won't exist for this tool to refresh, and the
+  Service Insights dashboards will have no DMOs to plot from regardless of
+  how much Case data is loaded.
+
+Skipping either app's setup doesn't make this tool fail loudly — the
+refresh step just finds nothing to refresh (dataflow not found / no matching
+data streams) and reports "not found"/skips it, so an apparently clean run
+can still leave a dashboard blank. Confirm both are provisioned first; see
+[Deploying to a new org → Prerequisites checklist](#1-prerequisites-checklist)
+for the full pre-flight list.
+
 ## Install
 
 ```bash
@@ -210,8 +240,10 @@ Before the first run against a new org, confirm:
   does not install the app itself.
 - [ ] If you also care about Tableau Next: the "Service Insights" app is
   already provisioned (Setup → check for a workspace built from the
-  `sfdc_internal__ServiceInsights` template). Same story — this tool doesn't
-  install it.
+  `sfdc_internal__ServiceInsights` template) **and** Data Cloud's Service
+  Data Kit is installed and mapped — see
+  [Required app setup](#required-app-setup-not-installed-by-this-tool)
+  above. Same story — this tool doesn't install either.
 - [ ] **Each org has its own copy** of the dataflow, dashboards, and any
   live patches applied to them (different `02K...`/dashboard Ids per org).
   A fix applied to one org's live definition does nothing for any other org
