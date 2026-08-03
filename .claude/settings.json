@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/bin/python3 -c \"import simple_salesforce\")",
+      "Bash(sf org list)",
+      "Bash(python3 -m venv .venv)",
+      "Bash(source .venv/bin/activate)",
+      "Bash(pip install -r requirements.txt)",
+      "Bash(python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt)",
+      "Bash(PYTHONPATH=src python3 -m service_insights_data_import --org * run --profile *)",
+      "Bash(PYTHONPATH=src python3 -m service_insights_data_import --org * verify *)"
+    ],
+    "ask": [
+      "Bash(PYTHONPATH=src python3 -m service_insights_data_import --org * run --profile * --live *)",
+      "Bash(PYTHONPATH=src python3 -m service_insights_data_import --org * undo *)"
+    ]
+  }
+}

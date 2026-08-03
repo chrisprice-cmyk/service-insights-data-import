@@ -66,8 +66,15 @@ below need to already be set up on the target org before you run this tool,
 or there's nothing for the refresh step to feed into.
 
 - **CRM Analytics "Service Analytics"** — the app (dataflow + dashboards)
-  must already be installed. This tool starts the existing
-  `Service_Analytics_eltDataflow` dataflow; it does not create it.
+  must already be installed. This tool starts the existing Service Analytics
+  dataflow; it does not create it. The dataflow's name/label is whatever the
+  person who installed the package called it (observed in the wild as both
+  `Service_Analytics_eltDataflow` and `Service_Analytics_V6_eltDataflow`), so
+  this tool doesn't rely on an exact name — it looks for a dataflow whose
+  name/label mention "service" and "analytic", falling back to inspecting
+  each candidate dataflow's definition for a `ServiceCase`-aliased register
+  node (present in every version of the packaged dataflow regardless of its
+  name) if that's ambiguous.
 - **Tableau Next "Service Insights"** — the app must already be provisioned
   (Setup → check for a workspace built from the `sfdc_internal__ServiceInsights`
   template), **and** Data Cloud's **Service Data Kit** must already be
@@ -188,8 +195,10 @@ an `undo` automatically triggers all of the following, in order:
   triggers and waits for this replication before touching the dataflow
   below — it's not optional, since the dataflow depends on it having
   actually finished.
-- **CRM Analytics dataflow**: starts the `Service_Analytics_eltDataflow`
-  dataflow (`POST .../wave/dataflowjobs`). This *can* be polled to
+- **CRM Analytics dataflow**: starts the Service Analytics dataflow
+  (`POST .../wave/dataflowjobs`), auto-discovered by name/label hints or the
+  `ServiceCase` register node (see [Required app setup](#required-app-setup-not-installed-by-this-tool)
+  above) rather than an exact hardcoded name. This *can* be polled to
   completion — pass `--wait-for-crma` on `run --live` or `undo` to block
   until the job finishes instead of firing and moving on. This dataflow's
   Case/EmailMessage/CaseArticle/Task extracts all run as full re-extracts

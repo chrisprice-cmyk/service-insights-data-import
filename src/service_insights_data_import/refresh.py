@@ -47,6 +47,8 @@ endpoint (data-transform runs have one; data-stream runs don't, confirmed
 against the Data 360 Connect REST API reference) -- fire-and-forget only.
 """
 
+import html
+import json
 import time
 
 # Source objects this tool ever inserts/updates/deletes. Only Data Cloud
@@ -59,7 +61,16 @@ import time
 REFRESH_SOURCE_OBJECTS = {"Case", "EmailMessage", "CaseArticle", "Task"}
 CRMA_REPLICATION_SOURCE_OBJECTS = {"Case", "CaseArticle", "Task", "CaseHistory"}
 
-SERVICE_ANALYTICS_DATAFLOW_NAME = "Service_Analytics_eltDataflow"
+# The CRMA Service Analytics app's dataflow is named/labeled by whoever
+# installed the package -- observed in the wild as "Service_Analytics_eltDataflow",
+# "Service_Analytics_V6_eltDataflow", etc. -- so its name can't be hardcoded.
+# "service" + "analytic" as substrings of the dataflow name/label is a cheap
+# first filter; ServiceCase is the ground-truth signal because every version
+# of the packaged dataflow registers a Wave dataset with this exact alias
+# (confirmed against Prime_SDO's dataflow definition), regardless of what the
+# dataflow itself is named.
+DATAFLOW_NAME_HINTS = ("service", "analytic")
+SERVICE_ANALYTICS_REGISTER_ALIAS = "ServiceCase"
 
 POLL_INTERVAL_SECONDS = 5
 POLL_TIMEOUT_SECONDS = 300
@@ -158,10 +169,43 @@ def refresh_crma_replication(sf, wait: bool = True) -> dict:
     return results
 
 
-def find_dataflow_id(sf, dataflow_name: str = SERVICE_ANALYTICS_DATAFLOW_NAME) -> str | None:
+def _dataflow_registers_service_case(sf, dataflow_id: str) -> bool:
+    """True if this dataflow's definition registers a Wave dataset aliased
+    ServiceCase -- the packaged Service Analytics dataflow does this under
+    any name/label (see DATAFLOW_NAME_HINTS comment above). The definition
+    field is HTML-entity-encoded JSON, same as noted for dashboard state."""
+    resp = sf._call_salesforce("GET", f"{_api(sf)}/wave/dataflows/{dataflow_id}")
+    definition = resp.json().get("definition", {})
+    if isinstance(definition, str):
+        definition = json.loads(html.unescape(definition))
+    for node in definition.values():
+        if node.get("action") == "sfdcRegister" and (
+            node.get("parameters", {}).get("alias") == SERVICE_ANALYTICS_REGISTER_ALIAS
+        ):
+            return True
+    return False
+
+
+def find_dataflow_id(sf) -> str | None:
+    """Finds the CRMA Service Analytics dataflow regardless of what it's
+    named -- that name is set by whoever installed the package, not by the
+    template itself. Cheap name/label filter first; if that's ambiguous (no
+    match, or more than one), fall back to inspecting each candidate's
+    definition for the ServiceCase register node, which every version of the
+    packaged dataflow has under any name."""
     resp = sf._call_salesforce("GET", f"{_api(sf)}/wave/dataflows")
-    for dataflow in resp.json().get("dataflows", []):
-        if dataflow.get("name") == dataflow_name:
+    dataflows = resp.json().get("dataflows", [])
+
+    candidates = [
+        df for df in dataflows
+        if all(hint in (df.get("name", "") + df.get("label", "")).lower() for hint in DATAFLOW_NAME_HINTS)
+    ]
+    if len(candidates) == 1:
+        return candidates[0]["id"]
+
+    pool = candidates if candidates else dataflows
+    for dataflow in pool:
+        if _dataflow_registers_service_case(sf, dataflow["id"]):
             return dataflow["id"]
     return None
 
