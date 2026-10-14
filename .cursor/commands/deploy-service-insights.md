@@ -7,7 +7,7 @@ of truth if anything here seems out of date; do not duplicate their
 content, read them.
 
 (This is the Cursor copy of the Claude Code skill at
-`.claude/skills/deploy-service-insights/SKILL.md` — keep both in sync if
+`SKILL.md` at the repo root — keep both in sync if
 you edit one.)
 
 ## Before doing anything: ask these questions up front
